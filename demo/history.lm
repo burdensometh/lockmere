@@ -1,0 +1,39 @@
+# The competing write begins after the read. A parked operation can be polled
+# explicitly, so graph assertions remain repeatable without timers.
+DO writer seed-begin OK BEGIN
+DO writer seed-badge OK INSERT INTO badge (id, branch_id) VALUES ('alpha', 1)
+DO writer seed-branch OK INSERT INTO branch (id, code) VALUES (1, 'north')
+DO writer seed-commit OK COMMIT
+ASSERT_SEQUENCE 1
+
+DO reader read-begin OK BEGIN SERIALIZABLE
+DO reader read-range OK SELECT * FROM branch WHERE id >= 1 AND id < 5
+DO writer write-begin OK BEGIN SNAPSHOT
+DO writer write-branch WAITING INSERT INTO branch (id, code) VALUES (3, 'south')
+ASSERT_EDGES 1
+DO observer locks OK SHOW LOCKS
+POLL writer WAITING
+DO reader read-commit OK COMMIT
+ASSERT_EDGES 0
+POLL writer OK
+DO writer write-commit OK COMMIT
+
+DO writer repair-begin OK BEGIN
+DO writer repair-mark OK SAVEPOINT batch
+DO writer repair-child OK INSERT INTO badge (id, branch_id) VALUES ('stray', 88)
+DO writer repair-test CONSTRAINT_VIOLATION SET CONSTRAINTS badge_branch IMMEDIATE
+DO writer repair-rollback OK ROLLBACK TO batch
+DO writer repair-test-again OK SET CONSTRAINTS ALL IMMEDIATE
+DO writer repair-commit OK COMMIT
+
+DO observer events OK SHOW EVENTS
+DO observer history OK SHOW HISTORY
+DO observer checkpoint OK CHECKPOINT
+ASSERT_SEQUENCE 4
+REOPEN
+DO writer write-commit REPLAYED COMMIT
+DO reader check-begin OK BEGIN SNAPSHOT
+DO reader reread-branches OK SELECT * FROM branch
+DO reader reread-badge OK GET badge 'alpha'
+DO reader check-end OK ROLLBACK
+ASSERT_SEQUENCE 4

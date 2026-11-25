@@ -1,0 +1,19 @@
+[package]
+name = "lockmere"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.90"
+description = "Embedded relational transaction engine with predicate locking and a v1 journal"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "lockmere"
+path = "src/main.rs"
+
+[[bench]]
+name = "hotspots"
+harness = false
+
+[dependencies]

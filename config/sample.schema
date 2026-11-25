@@ -1,0 +1,4 @@
+table badge TEXT branch_id:INT! note:TEXT?
+table branch INT code:TEXT!
+foreign badge_branch badge.branch_id branch.id deferrable-deferred
+unique branch_code branch.code immediate
