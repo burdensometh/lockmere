@@ -25,6 +25,7 @@ fn main() {
     assert!((1..=20).contains(&scale), "bench scale must be 1..=20");
     index_scan(100_000 * scale, 1_500);
     wait_graph(64 * scale.min(4), 600);
+    sparse_enqueue(500, 200);
     recovery(&root.0, 30 * scale, 48);
 }
 
@@ -81,6 +82,54 @@ fn wait_graph(waiters: usize, rounds: usize) {
         "wait_graph waiters={waiters} graphs={rounds} observed_edges={count} micros={}",
         timer.elapsed().as_micros()
     );
+}
+
+// Models the sparse lock graph: hundreds of disjoint waiting groups where a
+// newly queued three-node group must only inspect its own reachable slice.
+// Each probe re-creates one waiting request against a fixed holder, which is
+// exactly the enqueue-time cycle check the localized search now serves.
+fn sparse_enqueue(groups: usize, rounds: usize) {
+    let point = |table: &str, id: u64, mode: LockMode| {
+        LockRequest::new(id, ReadInterval::point(&RowId::new(table, 1i64)), mode)
+    };
+    let mut locks = LockManager::default();
+    for group in 0..groups {
+        let table = format!("group_{group}");
+        let holder = 1_000 + group as u64;
+        locks
+            .enqueue(point(&table, holder, LockMode::Exclusive))
+            .unwrap();
+        locks
+            .enqueue(point(&table, holder + 5_000, LockMode::Shared))
+            .unwrap();
+    }
+    assert_eq!(locks.waiting_count(), groups);
+
+    // A stable three-node group on its own locks; the probe parks a fresh
+    // waiter that closes no cycle, then cancels it, so state stays constant.
+    locks
+        .enqueue(point("probe_a", 9_001, LockMode::Exclusive))
+        .unwrap();
+    locks
+        .enqueue(point("probe_b", 9_002, LockMode::Exclusive))
+        .unwrap();
+    let timer = Instant::now();
+    for _ in 0..rounds {
+        let acquired = locks
+            .enqueue(point("probe_a", 9_002, LockMode::Exclusive))
+            .unwrap();
+        let lockmere::locks::Acquire::Waiting(ticket) = acquired else {
+            panic!("probe must wait, got {acquired:?}");
+        };
+        black_box(ticket);
+        locks.cancel(ticket).unwrap();
+    }
+    println!(
+        "sparse_enqueue groups={groups} rounds={rounds} waiting={} micros={}",
+        locks.waiting_count(),
+        timer.elapsed().as_micros()
+    );
+    assert_eq!(locks.waiting_count(), groups + 2);
 }
 
 fn recovery(root: &Path, commits: usize, writes: usize) {
