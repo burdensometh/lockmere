@@ -12,7 +12,7 @@ use lockmere::{
     locks::Blocker,
     ConstraintMode, Error, Event,
     Isolation::{Serializable, Snapshot},
-    Key, Operation, OperationResult, ReadInterval, Row, RowId, Step, Value,
+    Key, Operation, OperationResult, ReadInterval, Record, Row, RowId, Step, Value,
 };
 
 use support::{badge, branch, engine, get, seed, Scratch};
@@ -119,6 +119,103 @@ fn checkpoint_compaction_respects_oldest_snapshot() {
     assert_eq!(get(&db, old, row).unwrap().values["code"], "south".into());
     db.rollback(old).unwrap();
     assert_eq!(db.checkpoint().unwrap().collected_versions, 2);
+}
+
+#[test]
+fn checkpoint_reclamation_only_touches_revised_hot_keys() {
+    let root = Scratch::new();
+    let db = engine(root.db());
+    seed(&db);
+
+    // A field of mostly cold, single-version rows; none can ever be reclaimed.
+    let cold_count = 64u64;
+    let cold_tx = db.begin(Snapshot).unwrap().id;
+    for key in 10..10 + cold_count as i64 {
+        let code = format!("cold-{key}");
+        db.execute(
+            cold_tx,
+            Operation::Insert(Record::new(
+                RowId::new("branch", key),
+                Row::from([("code".to_owned(), Value::Text(code))]),
+            )),
+        )
+        .unwrap();
+    }
+    db.execute(cold_tx, Operation::Commit(None)).unwrap();
+
+    // A long-lived reader pins the committed sequence before the hot revisions.
+    let reader = db.begin(Snapshot).unwrap().id;
+    let pinned_snapshot = db.transaction(reader).unwrap().snapshot;
+
+    // Only two hot keys accumulate history.
+    let hot_a = RowId::new("branch", 1);
+    let hot_b = RowId::new("branch", 2);
+    for code in ["a2", "a3"] {
+        let writer = db.begin(Snapshot).unwrap().id;
+        db.execute(
+            writer,
+            Operation::Update {
+                id: hot_a.clone(),
+                patch: Row::from([("code".to_owned(), code.into())]),
+            },
+        )
+        .unwrap();
+        db.execute(writer, Operation::Commit(None)).unwrap();
+    }
+    for code in ["b2", "b3"] {
+        let writer = db.begin(Snapshot).unwrap().id;
+        db.execute(
+            writer,
+            Operation::Update {
+                id: hot_b.clone(),
+                patch: Row::from([("code".to_owned(), code.into())]),
+            },
+        )
+        .unwrap();
+        db.execute(writer, Operation::Commit(None)).unwrap();
+    }
+
+    // While the reader is pinned, no obsolete version is collectible and the
+    // reader still observes the pre-revision state.
+    assert_eq!(db.checkpoint().unwrap().collected_versions, 0);
+    assert_eq!(
+        get(&db, reader, hot_a.clone()).unwrap().values["code"],
+        "north".into()
+    );
+    assert_eq!(
+        get(&db, reader, hot_b.clone()).unwrap().values["code"],
+        "south".into()
+    );
+    for key in 10..10 + cold_count as i64 {
+        assert!(get(&db, reader, RowId::new("branch", key)).is_some());
+    }
+
+    // Once the old reader ends, only the four obsolete versions of the two hot
+    // keys are collected; cold single-version heads stay intact.
+    db.rollback(reader).unwrap();
+    assert_eq!(db.checkpoint().unwrap().collected_versions, 4);
+    // Repeated checkpoints have nothing left to reclaim.
+    assert_eq!(db.checkpoint().unwrap().collected_versions, 0);
+
+    // Committed heads are retained permanently, including the cold keys.
+    let current = db.begin(Snapshot).unwrap().id;
+    assert_eq!(
+        get(&db, current, hot_a).unwrap().values["code"],
+        "a3".into()
+    );
+    assert_eq!(
+        get(&db, current, hot_b).unwrap().values["code"],
+        "b3".into()
+    );
+    for key in 10..10 + cold_count as i64 {
+        let record = get(&db, current, RowId::new("branch", key)).unwrap();
+        assert_eq!(record.values["code"], Value::Text(format!("cold-{key}")));
+    }
+    assert_eq!(
+        db.transaction(current).unwrap().snapshot,
+        pinned_snapshot + 4
+    );
+    db.rollback(current).unwrap();
 }
 
 #[test]
