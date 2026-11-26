@@ -32,8 +32,7 @@ struct Savepoint {
 
 pub(crate) struct StatementContext<'a> {
     pub schema: &'a Schema,
-    pub index: &'a RowIndex,
-    pub latest: Sequence,
+    pub index: &'a mut RowIndex,
     pub options: &'a Options,
     pub events: &'a mut Vec<Event>,
 }
@@ -110,8 +109,7 @@ impl Workspace {
         }
         let intent = keep_intent.then_some(WriteIntent { base, values });
         let previous = self.intents.replace(id.clone(), intent);
-        let mut evaluator =
-            Evaluator::new(context.schema, context.index, context.latest, &self.intents);
+        let mut evaluator = Evaluator::new(context.schema, context.index, &self.intents);
         let checks = evaluator.statement(&id.table, &self.modes);
         let verdict = verdict(self.info.id, context.events, checks);
         if let Err(error) = verdict {
@@ -182,8 +180,7 @@ impl Workspace {
             next.set(constraint, mode)?;
         }
         if mode == ConstraintMode::Immediate {
-            let mut evaluator =
-                Evaluator::new(context.schema, context.index, context.latest, &self.intents);
+            let mut evaluator = Evaluator::new(context.schema, context.index, &self.intents);
             let checks = constraints
                 .iter()
                 .map(|constraint| evaluator.check(constraint, Phase::ModeChange))
@@ -202,8 +199,7 @@ impl Workspace {
                 return Err(self.stale_write(&id, newest));
             }
         }
-        let mut evaluator =
-            Evaluator::new(context.schema, context.index, context.latest, &self.intents);
+        let mut evaluator = Evaluator::new(context.schema, context.index, &self.intents);
         verdict(self.info.id, context.events, evaluator.commit())
     }
 

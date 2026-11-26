@@ -53,7 +53,7 @@ impl DurableState {
                 }),
             );
         }
-        let mut checks = Evaluator::new(schema, &self.index, self.sequence, &staged);
+        let mut checks = Evaluator::new(schema, &mut self.index, &staged);
         if let Some(error) = checks.commit().iter().find_map(|check| check.as_error()) {
             return Err(error.to_string());
         }

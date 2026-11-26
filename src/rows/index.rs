@@ -1,15 +1,83 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
-    Key, PendingRows, ReadInterval, Record, Row, RowId, RowVersion, Sequence, TxId, VersionChange,
+    Key, PendingRows, ReadInterval, Record, Row, RowId, RowVersion, Sequence, TxId, Value,
+    VersionChange,
 };
+use crate::constraints::{ConstraintKind, Schema, PRIMARY_KEY};
 
 type VersionChain = Vec<RowVersion>;
 type TableIndex = BTreeMap<Key, VersionChain>;
 
+/// A constrained non-primary column that needs a value-to-rows lookup path.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ColumnRef {
+    pub table: String,
+    pub column: String,
+}
+
+/// One row's membership under an indexed value. Tombstones let pending deletes
+/// shadow committed entries while the overlay is merged for a constraint check.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct IndexEntry {
+    pub row_key: Key,
+    pub live: bool,
+}
+
+/// Secondary indexes keyed by constrained column. Each index maps a column
+/// value to the set of live row keys currently holding that value.
+#[derive(Debug, Default)]
+pub(crate) struct SecondaryIndex {
+    columns: BTreeMap<ColumnRef, BTreeMap<Value, BTreeSet<Key>>>,
+}
+
+impl SecondaryIndex {
+    fn add(&mut self, column: &ColumnRef, value: Value, row_key: Key) {
+        self.columns
+            .entry(ColumnRef {
+                table: column.table.clone(),
+                column: column.column.clone(),
+            })
+            .or_default()
+            .entry(value)
+            .or_default()
+            .insert(row_key);
+    }
+
+    fn remove(&mut self, column: &ColumnRef, value: &Value, row_key: &Key) {
+        if let Some(values) = self.columns.get_mut(column) {
+            if let Some(rows) = values.get_mut(value) {
+                rows.remove(row_key);
+                if rows.is_empty() {
+                    values.remove(value);
+                }
+            }
+            if values.is_empty() {
+                self.columns.remove(column);
+            }
+        }
+    }
+
+    fn entries(&self, column: &ColumnRef, value: &Value) -> Vec<IndexEntry> {
+        self.columns
+            .get(column)
+            .and_then(|values| values.get(value))
+            .map(|rows| {
+                rows.iter()
+                    .map(|row_key| IndexEntry {
+                        row_key: row_key.clone(),
+                        live: true,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct RowIndex {
     tables: BTreeMap<String, TableIndex>,
+    secondary: SecondaryIndex,
 }
 
 impl RowIndex {
@@ -124,6 +192,121 @@ impl RowIndex {
         })
     }
 
+    /// Point lookup through a constrained column. Primary-key columns are
+    /// served by the primary index; every other constrained column uses a
+    /// lazily materialized secondary index. Each returned entry is one index
+    /// item actually touched by the lookup.
+    pub(crate) fn lookup_column(
+        &mut self,
+        schema: &Schema,
+        table: &str,
+        column: &str,
+        value: &Value,
+    ) -> Vec<IndexEntry> {
+        if column == PRIMARY_KEY {
+            let Ok(key) = value.clone().into_key() else {
+                return Vec::new();
+            };
+            let live = self
+                .tables
+                .get(table)
+                .and_then(|rows| rows.get(&key))
+                .and_then(|chain| chain.last())
+                .is_some_and(|head| head.values.is_some());
+            return live
+                .then(|| {
+                    vec![IndexEntry {
+                        row_key: key,
+                        live: true,
+                    }]
+                })
+                .unwrap_or_default();
+        }
+        self.ensure_secondary(schema);
+        self.secondary.entries(
+            &ColumnRef {
+                table: table.to_owned(),
+                column: column.to_owned(),
+            },
+            value,
+        )
+    }
+
+    fn ensure_secondary(&mut self, schema: &Schema) {
+        let needed: BTreeSet<ColumnRef> = schema
+            .constraints()
+            .flat_map(|constraint| match &constraint.kind {
+                ConstraintKind::Unique { table, column } => {
+                    vec![ColumnRef {
+                        table: table.clone(),
+                        column: column.clone(),
+                    }]
+                }
+                ConstraintKind::ForeignKey {
+                    table,
+                    column,
+                    parent,
+                    parent_column,
+                } => vec![
+                    ColumnRef {
+                        table: table.clone(),
+                        column: column.clone(),
+                    },
+                    ColumnRef {
+                        table: parent.clone(),
+                        column: parent_column.clone(),
+                    },
+                ],
+            })
+            .filter(|column| column.column != PRIMARY_KEY)
+            .collect();
+        let have: BTreeSet<ColumnRef> = self.secondary.columns.keys().cloned().collect();
+        for column in needed.difference(&have) {
+            self.build_column(column);
+        }
+        // Constraints never change for the life of a store; drop any columns
+        // that are no longer referenced so the cache cannot serve stale shapes.
+        for stale in have.difference(&needed) {
+            self.secondary.columns.remove(stale);
+        }
+    }
+
+    fn build_column(&mut self, column: &ColumnRef) {
+        let mut index: BTreeMap<Value, BTreeSet<Key>> = BTreeMap::new();
+        if let Some(table) = self.tables.get(&column.table) {
+            for (key, chain) in table {
+                if let Some(head) = chain.last() {
+                    if let Some(values) = &head.values {
+                        if let Some(value) = values.get(&column.column) {
+                            index.entry(value.clone()).or_default().insert(key.clone());
+                        }
+                    }
+                }
+            }
+        }
+        self.secondary.columns.insert(column.clone(), index);
+    }
+
+    fn index_change(&mut self, column: &ColumnRef, change: &VersionChange, previous: Option<&Row>) {
+        if column.column == PRIMARY_KEY {
+            return;
+        }
+        if !self.secondary.columns.contains_key(column) {
+            return;
+        }
+        // The caller captures the row's prior head before appending the new
+        // version, so this stays correct after old MVCC versions are collected.
+        if let Some(old) = previous.and_then(|row| row.get(&column.column)) {
+            self.secondary.remove(column, old, &change.id.key);
+        }
+        if let Some(row) = change.values.as_ref() {
+            if let Some(value) = row.get(&column.column) {
+                self.secondary
+                    .add(column, value.clone(), change.id.key.clone());
+            }
+        }
+    }
+
     pub fn push(&mut self, id: RowId, version: RowVersion) {
         let chain = self
             .tables
@@ -143,11 +326,32 @@ impl RowIndex {
         transaction: TxId,
         changes: impl IntoIterator<Item = VersionChange>,
     ) {
-        for change in changes {
+        let changes: Vec<VersionChange> = changes.into_iter().collect();
+        let indexed: Vec<ColumnRef> = self.secondary.columns.keys().cloned().collect();
+        // Capture each changed row's committed head before any chain is
+        // appended; the secondary index deltas are computed against that view.
+        let previous: Vec<Option<Row>> = changes
+            .iter()
+            .map(|change| {
+                self.tables
+                    .get(&change.id.table)
+                    .and_then(|table| table.get(&change.id.key))
+                    .and_then(|chain| chain.last())
+                    .and_then(|head| head.values.clone())
+            })
+            .collect();
+        for change in &changes {
             self.push(
-                change.id,
-                RowVersion::new(sequence, transaction, change.values),
+                change.id.clone(),
+                RowVersion::new(sequence, transaction, change.values.clone()),
             );
+        }
+        for column in &indexed {
+            for (change, before) in changes.iter().zip(previous.iter()) {
+                if change.id.table == column.table {
+                    self.index_change(column, change, before.as_ref());
+                }
+            }
         }
     }
 

@@ -223,8 +223,7 @@ impl State {
                 let tx = self.transactions.get_mut(&id).expect("active transaction");
                 let mut context = StatementContext {
                     schema,
-                    index: &self.durable.index,
-                    latest: self.durable.sequence,
+                    index: &mut self.durable.index,
                     options,
                     events: &mut events,
                 };
@@ -262,8 +261,7 @@ impl State {
         let tx = self.transactions.get(&id).expect("active transaction");
         let mut context = StatementContext {
             schema,
-            index: &self.durable.index,
-            latest: self.durable.sequence,
+            index: &mut self.durable.index,
             options,
             events,
         };

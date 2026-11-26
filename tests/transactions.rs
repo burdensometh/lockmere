@@ -414,3 +414,177 @@ fn pending_insert_deleted_before_commit_emits_no_invalid_tombstone() {
     assert!(db.history(0, 1).unwrap()[0].changes.is_empty());
     assert_eq!(Key::from(9), Key::Integer(9));
 }
+
+fn commit_checks(
+    db: &lockmere::Engine,
+    transaction: u64,
+    name: &str,
+) -> Vec<lockmere::constraints::ConstraintCheck> {
+    let (_, _, events) = db.events(0).unwrap();
+    events
+        .into_iter()
+        .filter_map(|(_, event)| match event {
+            Event::Check {
+                transaction: owner,
+                result,
+            } if owner == transaction && result.name == name && result.phase == Phase::Commit => {
+                Some(result)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn commit_foreign_key_reads_scale_with_candidates_not_child_table_size() {
+    let root = Scratch::new();
+    let db = engine(root.db());
+    seed(&db);
+    // A large fan-in: many child rows reference the same small set of parents.
+    let setup = db.begin(Snapshot).unwrap().id;
+    for index in 0..200 {
+        db.execute(setup, badge(&format!("bulk-{index}"), 1))
+            .unwrap();
+    }
+    db.execute(setup, Operation::Commit(None)).unwrap();
+
+    // One local insert must not rescan the 201 existing child rows.
+    let tx = db.begin(Snapshot).unwrap().id;
+    db.execute(tx, badge("local", 2)).unwrap();
+    db.execute(tx, Operation::Commit(None)).unwrap();
+
+    let checks = commit_checks(&db, tx, "badge_branch");
+    let examined: usize = checks.iter().map(|check| check.examined).sum();
+    assert!(
+        examined <= 4,
+        "one candidate value should touch only its index entries, examined={examined}"
+    );
+    assert!(checks
+        .iter()
+        .all(|check| matches!(check.outcome, CheckOutcome::Passed)));
+}
+
+#[test]
+fn commit_unique_reads_touch_only_changed_value_entries() {
+    let root = Scratch::new();
+    let db = engine(root.db());
+    seed(&db);
+    let setup = db.begin(Snapshot).unwrap().id;
+    for index in 0..100 {
+        db.execute(setup, branch(100 + index, &format!("code-{index}")))
+            .unwrap();
+    }
+    db.execute(setup, Operation::Commit(None)).unwrap();
+
+    // A single non-conflicting insert probes only its own code value.
+    let tx = db.begin(Snapshot).unwrap().id;
+    db.execute(tx, branch(999, "fresh-code")).unwrap();
+    db.execute(tx, Operation::Commit(None)).unwrap();
+    let checks = commit_checks(&db, tx, "branch_code");
+    let examined: usize = checks.iter().map(|check| check.examined).sum();
+    assert!(
+        examined <= 1,
+        "unique check must not scan the table, examined={examined}"
+    );
+
+    // A colliding value is caught immediately by the same narrow lookup.
+    let clash = db.begin(Snapshot).unwrap().id;
+    let error = db.execute(clash, branch(998, "code-7"));
+    let rejected = matches!(
+        error,
+        Err(Error::ConstraintViolation { ref name, .. }) if name == "branch_code"
+    );
+    assert!(rejected, "got {error:?}");
+    db.rollback(clash).unwrap();
+}
+
+#[test]
+fn parent_delete_concurrent_with_new_child_is_rejected_from_commit_view() {
+    let root = Scratch::new();
+    let db = engine(root.db());
+    seed(&db);
+    let parent = db.begin(Snapshot).unwrap().id;
+    let child = db.begin(Snapshot).unwrap().id;
+    // The child commits first, so its reference is valid at its own commit.
+    db.execute(child, badge("late", 2)).unwrap();
+    db.execute(child, Operation::Commit(None)).unwrap();
+    db.execute(parent, Operation::Delete(RowId::new("branch", 2)))
+        .unwrap();
+    let error = db.execute(parent, Operation::Commit(None));
+    let rejected = matches!(
+        error,
+        Err(Error::ConstraintViolation { ref name, .. }) if name == "badge_branch"
+    );
+    assert!(rejected, "an orphan must never be accepted, got {error:?}");
+    // The verdict names the surviving child seen only through the commit view.
+    let checks = commit_checks(&db, parent, "badge_branch");
+    assert!(checks.iter().any(|check| matches!(
+        &check.outcome,
+        CheckOutcome::MissingParent { value, child }
+            if *value == Value::Integer(2) && child == &RowId::new("badge", "late")
+    )));
+}
+
+#[test]
+fn repeated_references_to_one_parent_are_allowed_and_distinct_bad_values_are_not() {
+    let root = Scratch::new();
+    let db = engine(root.db());
+    seed(&db);
+
+    // Many children pointing at the same existing parent is legal.
+    let shared = db.begin(Snapshot).unwrap().id;
+    for index in 0..10 {
+        db.execute(shared, badge(&format!("shared-{index}"), 1))
+            .unwrap();
+    }
+    db.execute(shared, Operation::Commit(None)).unwrap();
+    let checks = commit_checks(&db, shared, "badge_branch");
+    assert!(checks
+        .iter()
+        .all(|check| matches!(check.outcome, CheckOutcome::Passed)));
+
+    // A value with no parent row loses, even alongside a valid sibling value.
+    let wrong = db.begin(Snapshot).unwrap().id;
+    db.execute(wrong, badge("valid", 2)).unwrap();
+    db.execute(wrong, badge("dangling", 99)).unwrap();
+    let error = db.execute(wrong, Operation::Commit(None));
+    let rejected = matches!(
+        error,
+        Err(Error::ConstraintViolation { ref name, .. }) if name == "badge_branch"
+    );
+    assert!(rejected, "got {error:?}");
+    let checks = commit_checks(&db, wrong, "badge_branch");
+    assert!(checks.iter().any(|check| matches!(
+        &check.outcome,
+        CheckOutcome::MissingParent { value, child }
+            if *value == Value::Integer(99) && child == &RowId::new("badge", "dangling")
+    )));
+}
+
+#[test]
+fn deleting_a_repaired_child_reference_lets_the_parent_delete_commit() {
+    let root = Scratch::new();
+    let db = engine(root.db());
+    seed(&db);
+    let writer = db.begin(Snapshot).unwrap().id;
+    db.execute(writer, badge("moveable", 2)).unwrap();
+    db.execute(writer, Operation::Commit(None)).unwrap();
+
+    // Reassign the only child away, then remove the parent: no orphan remains.
+    let tx = db.begin(Snapshot).unwrap().id;
+    db.execute(
+        tx,
+        Operation::Update {
+            id: RowId::new("badge", "moveable"),
+            patch: Row::from([("branch_id".to_owned(), 1.into())]),
+        },
+    )
+    .unwrap();
+    db.execute(tx, Operation::Delete(RowId::new("branch", 2)))
+        .unwrap();
+    db.execute(tx, Operation::Commit(None)).unwrap();
+    let checks = commit_checks(&db, tx, "badge_branch");
+    assert!(checks
+        .iter()
+        .all(|check| matches!(check.outcome, CheckOutcome::Passed)));
+}

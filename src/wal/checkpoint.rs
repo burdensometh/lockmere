@@ -175,7 +175,7 @@ pub(crate) fn read(
                 if codec::next_line(&mut reader, &mut line, CHECKPOINT_FILE, offset)? {
                     return Err(bad(offset, "unexpected data after checkpoint footer"));
                 }
-                validate_state(schema, &state, last_tx, sequences.len(), offset)?;
+                validate_state(schema, &mut state, last_tx, sequences.len(), offset)?;
                 return Ok(Some((anchor, state)));
             }
             _ => return Err(bad(offset, "unknown or out-of-order checkpoint record")),
@@ -257,7 +257,7 @@ fn decode_head(
 
 fn validate_state(
     schema: &Schema,
-    state: &DurableState,
+    state: &mut DurableState,
     last_tx: TxId,
     commits: usize,
     offset: u64,
@@ -274,7 +274,7 @@ fn validate_state(
         }
     }
     let empty = PendingRows::default();
-    let mut evaluator = Evaluator::new(schema, &state.index, state.sequence, &empty);
+    let mut evaluator = Evaluator::new(schema, &mut state.index, &empty);
     if let Some(error) = evaluator
         .recovery()
         .iter()
