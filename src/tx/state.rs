@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, VecDeque};
 use crate::{
     constraints::Schema,
     error::{Error, Result},
-    locks::{Acquire, LockManager, LockMode, LockRequest, WaitTicket},
+    locks::{Acquire, LockManager, LockMode, LockRequest, WaitPhase, WaitTicket},
     rows::{ReadInterval, Record, Sequence, TxId},
     wal::{CommitLog, DurableState, FaultPoint},
 };
@@ -120,6 +120,14 @@ impl State {
         options: &Options,
     ) -> Result<Step> {
         self.available()?;
+        // A ticket that was already delivered or timed out is never delivered
+        // again, even if its transaction has since ended.
+        if matches!(
+            self.locks.phase(ticket),
+            Some(WaitPhase::Delivered | WaitPhase::Cancelled)
+        ) {
+            return Err(Error::BadWaitTicket);
+        }
         let tx = self
             .transactions
             .get_mut(&ticket.transaction)
@@ -138,6 +146,12 @@ impl State {
     }
 
     pub fn timeout(&mut self, ticket: WaitTicket, options: &Options) -> Result<()> {
+        if matches!(
+            self.locks.phase(ticket),
+            Some(WaitPhase::Delivered | WaitPhase::Cancelled)
+        ) {
+            return Err(Error::BadWaitTicket);
+        }
         let tx = self
             .transactions
             .get_mut(&ticket.transaction)

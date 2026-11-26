@@ -7,7 +7,7 @@ use std::{
 use crate::{
     constraints::Schema,
     error::{Error, Result},
-    locks::{WaitGraph, WaitTicket},
+    locks::{WaitGraph, WaitPhase, WaitTicket},
     rows::{Sequence, TxId},
     wal::{CommitLog, Journal},
 };
@@ -65,12 +65,66 @@ impl Engine {
         result
     }
 
+    /// Drive a parked operation by one non-blocking step.
+    ///
+    /// This is the manual-polling half of the wait lifecycle; blocking
+    /// [`Engine::wait`] loops over the same [`State::resume`] transition.
     pub fn resume(&self, ticket: WaitTicket) -> Result<Step> {
         let result = self.guard()?.resume(ticket, &self.schema, &self.options);
         if !matches!(result, Ok(Step::Waiting(_))) {
             self.wake.notify_all();
         }
         result
+    }
+
+    /// Consolidated manual-poll entry point; identical to [`Engine::resume`].
+    pub fn poll(&self, ticket: WaitTicket) -> Result<Step> {
+        self.resume(ticket)
+    }
+
+    /// Non-blocking poll that maps a delivered step to its result.
+    ///
+    /// Returns `Ok(None)` while the ticket is still waiting and `Ok(Some(_))`
+    /// exactly once, when the parked operation completes.
+    pub fn try_wait(&self, ticket: WaitTicket) -> Result<Option<OperationResult>> {
+        match self.resume(ticket)? {
+            Step::Complete(result) => Ok(Some(result)),
+            Step::Waiting(_) => Ok(None),
+        }
+    }
+
+    /// Apply a lock-wait timeout to a ticket from the manual polling path.
+    ///
+    /// Only the pending wait/operation is discarded. Granted locks and the
+    /// transaction workspace (writes, savepoints, constraint modes) are
+    /// retained, so the transaction can issue another statement or retry.
+    /// The blocking [`Engine::wait`] uses the same [`State::timeout`] cleanup
+    /// when its deadline expires.
+    pub fn timeout(&self, ticket: WaitTicket) -> Result<()> {
+        let result = self.guard()?.timeout(ticket, &self.options);
+        if result.is_ok() {
+            self.wake.notify_all();
+        }
+        result
+    }
+
+    /// Alias for [`Engine::timeout`] using the lock manager's cancellation verb.
+    pub fn cancel(&self, ticket: WaitTicket) -> Result<()> {
+        self.timeout(ticket)
+    }
+
+    /// Tickets whose blockers have cleared and are ready to claim, in order.
+    pub fn ready(&self) -> Result<Vec<WaitTicket>> {
+        let state = self.guard()?;
+        state.available()?;
+        Ok(state.locks.ready())
+    }
+
+    /// Observable lifecycle phase of a ticket (`waiting`/`ready`/terminal).
+    pub fn wait_phase(&self, ticket: WaitTicket) -> Result<Option<WaitPhase>> {
+        let state = self.guard()?;
+        state.available()?;
+        Ok(state.locks.phase(ticket))
     }
 
     pub fn wait(&self, ticket: WaitTicket, timeout: Duration) -> Result<OperationResult> {

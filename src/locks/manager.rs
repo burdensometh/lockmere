@@ -41,7 +41,7 @@ impl LockRequest {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct WaitTicket {
     pub transaction: TxId,
     pub serial: u64,
@@ -60,11 +60,31 @@ struct QueueEntry {
     request: LockRequest,
 }
 
+/// Terminal outcome of a ticket that has left the waiting queue.
+///
+/// A ticket is recorded once it has been delivered ([`WaitPhase::Delivered`])
+/// or explicitly discarded by a timeout ([`WaitPhase::Cancelled`]). Recording
+/// the terminal phase is what guarantees a ticket can never be delivered twice,
+/// even after its transaction has ended and its workspace was removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitPhase {
+    /// Queued and still blocked by at least one conflicting request.
+    Waiting,
+    /// Blockers are gone; the next poll can claim and deliver the request.
+    Ready,
+    /// Claimed exactly once and delivered to the caller.
+    Delivered,
+    /// Removed by an explicit timeout/cancel without delivery.
+    Cancelled,
+}
+
 #[derive(Debug, Default)]
 pub struct LockManager {
     granted: BTreeMap<String, Vec<LockRequest>>,
     queue: BTreeMap<u64, QueueEntry>,
     pending: BTreeMap<TxId, u64>,
+    /// One-shot terminal outcomes, keyed by the full ticket identity.
+    terminal: BTreeMap<WaitTicket, WaitPhase>,
     next_serial: u64,
 }
 
@@ -98,7 +118,18 @@ impl LockManager {
         Ok(Acquire::Waiting(ticket))
     }
 
+    /// Single manual-poll transition of a wait ticket.
+    ///
+    /// Returns [`Acquire::Waiting`] without mutating the queue while blockers
+    /// remain. Once clear, the ticket is removed from the pending queue, its
+    /// request is granted exactly once, and the ticket is recorded as
+    /// [`WaitPhase::Delivered`]. Any later call for the same ticket — through
+    /// `claim`/`poll`, after timeout, or after the transaction ends — fails
+    /// with [`Error::BadWaitTicket`] instead of delivering it again.
     pub fn claim(&mut self, ticket: WaitTicket) -> Result<Acquire> {
+        if self.terminal.contains_key(&ticket) {
+            return Err(Error::BadWaitTicket);
+        }
         let entry = self
             .queue
             .get(&ticket.serial)
@@ -110,16 +141,47 @@ impl LockManager {
         let request = self
             .remove_pending(ticket.transaction)
             .expect("queued transaction");
+        self.terminal.insert(ticket, WaitPhase::Delivered);
         self.grant(request);
         Ok(Acquire::Granted)
     }
 
+    /// Consolidated poll entry point; identical lifecycle transition to
+    /// [`LockManager::claim`].
+    pub fn poll(&mut self, ticket: WaitTicket) -> Result<Acquire> {
+        self.claim(ticket)
+    }
+
     pub fn cancel(&mut self, ticket: WaitTicket) -> Result<()> {
+        if self.terminal.contains_key(&ticket) {
+            return Err(Error::BadWaitTicket);
+        }
         if self.pending.get(&ticket.transaction) != Some(&ticket.serial) {
             return Err(Error::BadWaitTicket);
         }
         self.remove_pending(ticket.transaction);
+        self.terminal.insert(ticket, WaitPhase::Cancelled);
         Ok(())
+    }
+
+    /// Observable lifecycle phase of a ticket.
+    ///
+    /// Returns `None` for a ticket this manager has never issued or for a
+    /// ticket whose transaction was aborted and swept without an explicit
+    /// terminal decision.
+    pub fn phase(&self, ticket: WaitTicket) -> Option<WaitPhase> {
+        if let Some(phase) = self.terminal.get(&ticket) {
+            return Some(*phase);
+        }
+        let entry = self
+            .queue
+            .get(&ticket.serial)
+            .filter(|entry| entry.ticket == ticket)?;
+        if self.blockers(&entry.request, ticket.serial).is_empty() {
+            Some(WaitPhase::Ready)
+        } else {
+            Some(WaitPhase::Waiting)
+        }
     }
 
     pub fn release(&mut self, transaction: TxId) {

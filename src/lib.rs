@@ -10,6 +10,7 @@ pub use constraints::{
     Column, Constraint, ConstraintKind, ConstraintMode, Schema, Table, Timing, PRIMARY_KEY,
 };
 pub use error::{Error, Result};
+pub use locks::{WaitPhase, WaitTicket};
 pub use rows::{Key, KeyKind, ReadInterval, Record, Row, RowId, Sequence, TxId, Value};
 pub use tx::{
     CheckpointInfo, CommitResult, Engine, Event, FaultInjector, FaultPoint, Isolation, Operation,
