@@ -1,8 +1,13 @@
+use std::collections::{BTreeSet, VecDeque};
+
 use crate::{
-    constraints::{ConstraintMode, ConstraintModes, Evaluator, Phase, Schema},
+    constraints::{ConstraintMode, ConstraintModes, Evaluator, Phase, Schema, PRIMARY_KEY},
     error::{Error, Result},
     locks::WaitTicket,
-    rows::{PendingRows, Row, RowId, RowIndex, RowVersion, Sequence, TxId, WriteIntent},
+    rows::{
+        PendingRows, ReadInterval, Row, RowId, RowIndex, RowVersion, Sequence, TxId, Value,
+        WriteIntent,
+    },
 };
 
 use super::{Event, Isolation, Operation, Options, TransactionInfo};
@@ -78,6 +83,121 @@ impl Workspace {
         id: &RowId,
         change: Change,
     ) -> Result<()> {
+        let mut touched = Vec::new();
+        let mut tables = BTreeSet::new();
+        let staged = self
+            .stage_statement(context, id, change, &mut touched, &mut tables)
+            .and_then(|()| {
+                if !self.savepoints.is_empty()
+                    && self.undo.len() + touched.len() > context.options.max_undo
+                {
+                    return Err(Error::Limit("savepoint undo records"));
+                }
+                Ok(())
+            });
+        if let Err(error) = staged {
+            for (row, previous) in touched.into_iter().rev() {
+                self.intents.replace(row, previous);
+            }
+            return Err(error);
+        }
+        if !self.savepoints.is_empty() {
+            self.undo.extend(
+                touched
+                    .into_iter()
+                    .map(|(id, previous)| Undo { id, previous }),
+            );
+        }
+        Ok(())
+    }
+
+    fn stage_statement(
+        &mut self,
+        context: &mut StatementContext<'_>,
+        id: &RowId,
+        change: Change,
+        touched: &mut Vec<(RowId, Option<WriteIntent>)>,
+        tables: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        let updated = matches!(change, Change::Update(_));
+        let (before, after) = self.apply(context, id, change, touched)?;
+        tables.insert(id.table.clone());
+        if updated {
+            self.cascade(context, id, &before, &after, touched, tables)?;
+        }
+        let mut evaluator =
+            Evaluator::new(context.schema, context.index, context.latest, &self.intents);
+        let tables: BTreeSet<&str> = tables.iter().map(String::as_str).collect();
+        let checks = evaluator.statement_over(&tables, &self.modes);
+        verdict(self.info.id, context.events, checks)
+    }
+
+    fn cascade(
+        &mut self,
+        context: &mut StatementContext<'_>,
+        id: &RowId,
+        before: &Option<Row>,
+        after: &Option<Row>,
+        touched: &mut Vec<(RowId, Option<WriteIntent>)>,
+        tables: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        let mut worklist = VecDeque::new();
+        if let (Some(before), Some(after)) = (before, after) {
+            enqueue_cascades(context.schema, id, before, after, &mut worklist);
+        }
+        let mut visited = BTreeSet::new();
+        while let Some((name, old, new)) = worklist.pop_front() {
+            if !visited.insert((name.clone(), old.clone())) {
+                continue;
+            }
+            let schema = context.schema;
+            let constraint = schema.constraint(&name)?;
+            let crate::constraints::ConstraintKind::ForeignKey { table, column, .. } =
+                &constraint.kind
+            else {
+                continue;
+            };
+            let children: Vec<RowId> = context
+                .index
+                .scan(
+                    &ReadInterval::whole(table),
+                    context.latest,
+                    &self.intents,
+                    usize::MAX,
+                )
+                .into_iter()
+                .filter(|record| referenced(&record.id, &record.values, column) == old)
+                .map(|record| record.id)
+                .collect();
+            if children.is_empty() {
+                continue;
+            }
+            for child in children {
+                let patch = Row::from([(column.clone(), new.clone())]);
+                let (child_before, child_after) =
+                    self.apply(context, &child, Change::Update(patch), touched)?;
+                if let (Some(child_before), Some(child_after)) = (child_before, child_after) {
+                    enqueue_cascades(
+                        context.schema,
+                        &child,
+                        &child_before,
+                        &child_after,
+                        &mut worklist,
+                    );
+                }
+            }
+            tables.insert(table.clone());
+        }
+        Ok(())
+    }
+
+    fn apply(
+        &mut self,
+        context: &StatementContext<'_>,
+        id: &RowId,
+        change: Change,
+        touched: &mut Vec<(RowId, Option<WriteIntent>)>,
+    ) -> Result<(Option<Row>, Option<Row>)> {
         let source = context.index.version_at(id, self.info.snapshot);
         let newest = context.index.latest(id);
         let base = source.map(|version| version.sequence);
@@ -86,6 +206,7 @@ impl Workspace {
             return Err(self.stale_write(id, newest));
         }
         let current = context.index.read(id, self.info.snapshot, &self.intents);
+        let before = current.cloned();
         let values = match (change, current) {
             (Change::Insert(row), None) => Some(context.schema.normalize_row(id, row)?),
             (Change::Insert(_), Some(_)) => return Err(Error::DuplicateKey(id.clone())),
@@ -105,26 +226,13 @@ impl Workspace {
         if keep_intent && creates_intent && self.intents.len() >= context.options.max_intents {
             return Err(Error::Limit("transaction writes"));
         }
-        if !self.savepoints.is_empty() && self.undo.len() >= context.options.max_undo {
-            return Err(Error::Limit("savepoint undo records"));
-        }
-        let intent = keep_intent.then_some(WriteIntent { base, values });
+        let intent = keep_intent.then_some(WriteIntent {
+            base,
+            values: values.clone(),
+        });
         let previous = self.intents.replace(id.clone(), intent);
-        let mut evaluator =
-            Evaluator::new(context.schema, context.index, context.latest, &self.intents);
-        let checks = evaluator.statement(&id.table, &self.modes);
-        let verdict = verdict(self.info.id, context.events, checks);
-        if let Err(error) = verdict {
-            self.intents.replace(id.clone(), previous);
-            return Err(error);
-        }
-        if !self.savepoints.is_empty() {
-            self.undo.push(Undo {
-                id: id.clone(),
-                previous,
-            });
-        }
-        Ok(())
+        touched.push((id.clone(), previous));
+        Ok((before, values))
     }
 
     pub fn savepoint(&mut self, name: String, max: usize) -> Result<()> {
@@ -239,5 +347,34 @@ fn verdict(
     match error {
         Some(error) => Err(error),
         None => Ok(()),
+    }
+}
+
+fn enqueue_cascades(
+    schema: &Schema,
+    id: &RowId,
+    before: &Row,
+    after: &Row,
+    worklist: &mut VecDeque<(String, Value, Value)>,
+) {
+    for constraint in schema.update_cascades(&id.table) {
+        let crate::constraints::ConstraintKind::ForeignKey { parent_column, .. } =
+            &constraint.kind
+        else {
+            continue;
+        };
+        let old = referenced(id, before, parent_column);
+        let new = referenced(id, after, parent_column);
+        if old != new {
+            worklist.push_back((constraint.name.clone(), old, new));
+        }
+    }
+}
+
+fn referenced(id: &RowId, values: &Row, column: &str) -> Value {
+    if column == PRIMARY_KEY {
+        id.key.value()
+    } else {
+        values.get(column).cloned().unwrap_or(Value::Null)
     }
 }

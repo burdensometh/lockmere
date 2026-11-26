@@ -114,10 +114,18 @@ impl<'a> Evaluator<'a> {
     }
 
     pub fn statement(&mut self, table: &str, modes: &ConstraintModes) -> Vec<ConstraintCheck> {
+        self.statement_over(&BTreeSet::from([table]), modes)
+    }
+
+    pub fn statement_over(
+        &mut self,
+        tables: &BTreeSet<&str>,
+        modes: &ConstraintModes,
+    ) -> Vec<ConstraintCheck> {
         let schema = self.schema;
         schema
             .constraints()
-            .filter(|constraint| constraint.kind.observes(table))
+            .filter(|constraint| tables.iter().any(|table| constraint.kind.observes(table)))
             .map(|constraint| {
                 if modes.mode(constraint) == ConstraintMode::Deferred {
                     ConstraintCheck {
@@ -159,6 +167,7 @@ impl<'a> Evaluator<'a> {
                 column,
                 parent,
                 parent_column,
+                ..
             } => self.foreign_key(table, column, parent, parent_column),
         };
         ConstraintCheck {

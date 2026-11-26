@@ -40,6 +40,21 @@ impl Timing {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnUpdate {
+    Restrict,
+    Cascade,
+}
+
+impl OnUpdate {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Restrict => "restrict",
+            Self::Cascade => "cascade",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Column {
     pub kind: KeyKind,
@@ -101,6 +116,7 @@ pub enum ConstraintKind {
         column: String,
         parent: String,
         parent_column: String,
+        on_update: OnUpdate,
     },
 }
 
@@ -144,6 +160,7 @@ impl Constraint {
         parent: &str,
         parent_column: &str,
         timing: Timing,
+        on_update: OnUpdate,
     ) -> Self {
         Self {
             name: name.to_owned(),
@@ -153,6 +170,7 @@ impl Constraint {
                 column: column.to_owned(),
                 parent: parent.to_owned(),
                 parent_column: parent_column.to_owned(),
+                on_update,
             },
         }
     }
@@ -225,6 +243,7 @@ impl Schema {
                 column,
                 parent,
                 parent_column,
+                ..
             } = &constraint.kind
             {
                 let source = schema.non_null_kind(table, column)?;
@@ -248,6 +267,19 @@ impl Schema {
 
     pub fn constraints(&self) -> impl Iterator<Item = &Constraint> {
         self.constraints.values()
+    }
+
+    pub fn update_cascades<'a>(&'a self, parent: &'a str) -> impl Iterator<Item = &'a Constraint> {
+        self.constraints.values().filter(move |constraint| {
+            matches!(
+                &constraint.kind,
+                ConstraintKind::ForeignKey {
+                    parent: target,
+                    on_update: OnUpdate::Cascade,
+                    ..
+                } if target == parent
+            )
+        })
     }
 
     pub fn table(&self, name: &str) -> Result<&Table> {

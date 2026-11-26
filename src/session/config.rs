@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, fs, path::Path, time::Duration};
 
 use crate::{
-    constraints::{Column, Constraint, ConstraintMode, Schema, Table, Timing},
+    constraints::{Column, Constraint, ConstraintMode, OnUpdate, Schema, Table, Timing},
     error::{Error, Result},
     rows::KeyKind,
     tx::Options,
@@ -81,9 +81,15 @@ pub fn parse_schema(source: &str) -> Result<Schema> {
                 let (table, column) = reference(source, line)?;
                 constraints.push(Constraint::unique(name, table, column, timing(when, line)?));
             }
-            ["foreign", name, source, target, when] => {
+            ["foreign", name, source, target, when, action @ ..] => {
                 let (table, column) = reference(source, line)?;
                 let (parent, target) = reference(target, line)?;
+                let on_update = match action {
+                    [] => OnUpdate::Restrict,
+                    ["on-update-restrict"] => OnUpdate::Restrict,
+                    ["on-update-cascade"] => OnUpdate::Cascade,
+                    _ => return Err(bad(line, "expected on-update-restrict or on-update-cascade")),
+                };
                 constraints.push(Constraint::foreign_key(
                     name,
                     table,
@@ -91,6 +97,7 @@ pub fn parse_schema(source: &str) -> Result<Schema> {
                     parent,
                     target,
                     timing(when, line)?,
+                    on_update,
                 ));
             }
             _ => return Err(bad(line, "expected table, unique, or foreign declaration")),

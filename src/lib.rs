@@ -7,7 +7,8 @@ pub mod tx;
 pub mod wal;
 
 pub use constraints::{
-    Column, Constraint, ConstraintKind, ConstraintMode, Schema, Table, Timing, PRIMARY_KEY,
+    Column, Constraint, ConstraintKind, ConstraintMode, OnUpdate, Schema, Table, Timing,
+    PRIMARY_KEY,
 };
 pub use error::{Error, Result};
 pub use rows::{Key, KeyKind, ReadInterval, Record, Row, RowId, Sequence, TxId, Value};

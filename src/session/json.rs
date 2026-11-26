@@ -266,15 +266,17 @@ fn schema(value: &Schema) -> String {
                     Timing::Deferrable(crate::ConstraintMode::Immediate) => "deferrable_immediate",
                     Timing::Deferrable(crate::ConstraintMode::Deferred) => "deferrable_deferred",
                 };
-                let (kind, parent) = match &constraint.kind {
-                    ConstraintKind::Unique { .. } => ("unique", null()),
+                let (kind, parent, on_update) = match &constraint.kind {
+                    ConstraintKind::Unique { .. } => ("unique", null(), null()),
                     ConstraintKind::ForeignKey {
                         parent,
                         parent_column,
+                        on_update: action,
                         ..
                     } => (
                         "foreign_key",
                         object([("table", quoted(parent)), ("column", quoted(parent_column))]),
+                        quoted(action.label()),
                     ),
                 };
                 object([
@@ -284,6 +286,7 @@ fn schema(value: &Schema) -> String {
                     ("table", quoted(table)),
                     ("column", quoted(column)),
                     ("parent", parent),
+                    ("on_update", on_update),
                 ])
             })),
         ),

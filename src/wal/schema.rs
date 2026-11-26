@@ -2,7 +2,7 @@ use std::io::BufRead;
 
 use super::{codec, JOURNAL_FILE};
 use crate::{
-    constraints::{Column, Constraint, ConstraintKind, ConstraintMode, Schema, Table, Timing},
+    constraints::{Column, Constraint, ConstraintKind, ConstraintMode, OnUpdate, Schema, Table, Timing},
     error::{Error, Result},
     rows::KeyKind,
 };
@@ -45,9 +45,14 @@ pub(crate) fn encode(schema: &Schema, identity: &str) -> Result<Vec<u8>> {
                 column,
                 parent,
                 parent_column,
+                on_update,
             } => {
+                let action = match on_update {
+                    OnUpdate::Restrict => "",
+                    OnUpdate::Cascade => "\tC",
+                };
                 header.push_str(&format!(
-                    "F\t{}\t{table}\t{column}\t{parent}\t{parent_column}\t{timing}\n",
+                    "F\t{}\t{table}\t{column}\t{parent}\t{parent_column}\t{timing}{action}\n",
                     constraint.name
                 ));
             }
@@ -141,7 +146,12 @@ fn decode(bytes: &[u8]) -> std::result::Result<(Schema, &str), String> {
                     decode_timing(timing)?,
                 ));
             }
-            ["F", name, table, column, parent, target, timing] => {
+            ["F", name, table, column, parent, target, timing, action @ ..] => {
+                let on_update = match action {
+                    [] => OnUpdate::Restrict,
+                    ["C"] => OnUpdate::Cascade,
+                    _ => return Err(format!("invalid on-update action in {line:?}")),
+                };
                 constraints.push(Constraint::foreign_key(
                     name,
                     table,
@@ -149,6 +159,7 @@ fn decode(bytes: &[u8]) -> std::result::Result<(Schema, &str), String> {
                     parent,
                     target,
                     decode_timing(timing)?,
+                    on_update,
                 ));
             }
             _ => return Err(format!("invalid schema line {line:?}")),
