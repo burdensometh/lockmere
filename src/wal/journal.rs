@@ -121,12 +121,12 @@ impl Journal {
             "seek history",
             reader.seek(SeekFrom::Start(self.data_start)),
         )?;
-        let mut line = Vec::new();
+        let mut frame = Vec::new();
         let mut offset = self.data_start;
         let mut expected = 1;
         let mut result = Vec::new();
         while offset < self.anchor.end && result.len() < limit {
-            let record = read_required(&mut reader, &mut line, offset)?;
+            let record = read_required(&mut reader, &mut frame, offset)?;
             if record.sequence != expected {
                 return Err(Error::corrupt(
                     JOURNAL_FILE,
@@ -138,7 +138,7 @@ impl Journal {
                 result.push(record);
             }
             expected += 1;
-            offset += line.len() as u64;
+            offset += frame.len() as u64;
         }
         Ok(result)
     }
@@ -175,18 +175,23 @@ impl Journal {
             "seek recovery target",
             reader.seek(SeekFrom::Start(anchor.end)),
         )?;
-        let mut line = Vec::new();
+        let mut frame = Vec::new();
         let mut torn = false;
-        while codec::next_line(&mut reader, &mut line, JOURNAL_FILE, anchor.end)? {
-            if line.last() != Some(&b'\n') {
-                torn = true;
-                break;
+        loop {
+            match read_frame(&mut reader, &mut frame, anchor.end)? {
+                FrameRead::End => break,
+                FrameRead::Torn => {
+                    torn = true;
+                    break;
+                }
+                FrameRead::Frame => {
+                    let record = decode_frame(&frame, anchor.end)?;
+                    state
+                        .apply_recovered(&schema, record)
+                        .map_err(|message| Error::corrupt(JOURNAL_FILE, anchor.end, message))?;
+                    anchor = Anchor::record(anchor.end, &frame);
+                }
             }
-            let record = decode_at(&line, anchor.end)?;
-            state
-                .apply_recovered(&schema, record)
-                .map_err(|message| Error::corrupt(JOURNAL_FILE, anchor.end, message))?;
-            anchor = Anchor::record(anchor.end, &line);
         }
         let file = reader.into_inner();
         if torn {
@@ -267,28 +272,13 @@ fn verify_anchor(
     if anchor.start == anchor.end || anchor.end - anchor.start > codec::MAX_LINE as u64 {
         return Err(bad("bad journal anchor size"));
     }
-    if anchor.start > data_start {
-        codec::io_result(
-            "seek prior journal delimiter",
-            reader.seek(SeekFrom::Start(anchor.start - 1)),
-        )?;
-        let mut newline = [0];
-        codec::io_result(
-            "read prior journal delimiter",
-            reader.read_exact(&mut newline),
-        )?;
-        if newline[0] != b'\n' {
-            return Err(bad("journal anchor is outside a record boundary"));
-        }
-    } else {
-        codec::io_result(
-            "seek journal anchor",
-            reader.seek(SeekFrom::Start(anchor.start)),
-        )?;
-    }
-    let mut line = Vec::new();
-    let record = read_required(reader, &mut line, anchor.start)?;
-    if !anchor.matches(&line) || !checkpoint::anchor_matches_commit(state, &record) {
+    codec::io_result(
+        "seek journal anchor",
+        reader.seek(SeekFrom::Start(anchor.start)),
+    )?;
+    let mut frame = Vec::new();
+    let record = read_required(reader, &mut frame, anchor.start)?;
+    if !anchor.matches(&frame) || !checkpoint::anchor_matches_commit(state, &record) {
         return Err(bad("checkpoint journal anchor mismatch"));
     }
     Ok(())
@@ -296,19 +286,118 @@ fn verify_anchor(
 
 fn read_required(
     reader: &mut impl std::io::BufRead,
-    line: &mut Vec<u8>,
+    frame: &mut Vec<u8>,
     offset: u64,
 ) -> Result<CommitLog> {
-    if !codec::next_line(reader, line, JOURNAL_FILE, offset)? {
-        return Err(Error::corrupt(
+    match read_frame(reader, frame, offset)? {
+        FrameRead::Frame => decode_frame(frame, offset),
+        FrameRead::End | FrameRead::Torn => Err(Error::corrupt(
             JOURNAL_FILE,
             offset,
             "expected a commit record",
-        ));
+        )),
     }
-    decode_at(line, offset)
 }
 
-fn decode_at(line: &[u8], offset: u64) -> Result<CommitLog> {
-    CommitLog::decode(line).map_err(|message| Error::corrupt(JOURNAL_FILE, offset, message))
+fn decode_frame(frame: &[u8], offset: u64) -> Result<CommitLog> {
+    let decoded = if frame.first() == Some(&codec::V2_MAGIC[0]) {
+        CommitLog::decode_v2(frame)
+    } else {
+        CommitLog::decode_v1(frame)
+    };
+    decoded.map_err(|message| Error::corrupt(JOURNAL_FILE, offset, message))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameRead {
+    /// Clean end of the journal at a frame boundary.
+    End,
+    /// The journal stops in the middle of a frame; the prefix is complete.
+    Torn,
+    /// A complete frame was read into the buffer.
+    Frame,
+}
+
+/// Reads one frame at `offset`, leaving its raw bytes in `frame`. V1 frames
+/// are newline-terminated text records; v2 frames are length-prefixed binary
+/// records tagged with `V2_MAGIC`. Anything that is not a prefix of a valid
+/// frame is corruption located at `offset`.
+fn read_frame(
+    reader: &mut impl std::io::BufRead,
+    frame: &mut Vec<u8>,
+    offset: u64,
+) -> Result<FrameRead> {
+    frame.clear();
+    let peek = codec::io_result("read durable frame", reader.fill_buf())?;
+    match peek.first() {
+        None => Ok(FrameRead::End),
+        Some(&byte) if byte == codec::V2_MAGIC[0] => read_v2_frame(reader, frame, offset),
+        Some(_) => {
+            codec::next_line(reader, frame, JOURNAL_FILE, offset)?;
+            if frame.last() == Some(&b'\n') {
+                Ok(FrameRead::Frame)
+            } else {
+                Ok(FrameRead::Torn)
+            }
+        }
+    }
+}
+
+fn read_v2_frame(
+    reader: &mut impl std::io::BufRead,
+    frame: &mut Vec<u8>,
+    offset: u64,
+) -> Result<FrameRead> {
+    let mut magic = [0; 2];
+    if !fill(reader, &mut magic)? {
+        return Ok(FrameRead::Torn);
+    }
+    frame.extend_from_slice(&magic);
+    if magic != codec::V2_MAGIC {
+        return Err(Error::corrupt(JOURNAL_FILE, offset, "unknown frame tag"));
+    }
+    let varint_start = frame.len();
+    loop {
+        let mut byte = [0];
+        if !fill(reader, &mut byte)? {
+            return Ok(FrameRead::Torn);
+        }
+        frame.push(byte[0]);
+        if byte[0] & 0x80 == 0 {
+            break;
+        }
+        if frame.len() - varint_start >= 10 {
+            return Err(Error::corrupt(
+                JOURNAL_FILE,
+                offset,
+                "frame length is not a valid varint",
+            ));
+        }
+    }
+    let (length, _) = codec::read_varint(&frame[varint_start..])
+        .map_err(|message| Error::corrupt(JOURNAL_FILE, offset, message))?;
+    if length > codec::MAX_LINE as u64 {
+        return Err(Error::corrupt(
+            JOURNAL_FILE,
+            offset,
+            "durable frame exceeds the size limit",
+        ));
+    }
+    let rest = usize::try_from(length).expect("length fits after limit check") + 4;
+    let start = frame.len();
+    frame.resize(start + rest, 0);
+    if !fill(reader, &mut frame[start..])? {
+        return Ok(FrameRead::Torn);
+    }
+    Ok(FrameRead::Frame)
+}
+
+/// Reads exactly `buffer.len()` bytes; reports whether the journal ended
+/// before the buffer was full.
+fn fill(reader: &mut impl std::io::Read, buffer: &mut [u8]) -> Result<bool> {
+    match reader.read_exact(buffer) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(Error::io("read durable frame", error)),
+    }
 }

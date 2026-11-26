@@ -47,11 +47,13 @@ Locks are released at transaction end. `ROLLBACK TO` restores pending writes and
 
 Schema configuration defines tables and named single-column constraints. Unique and foreign-key participants are non-null. A foreign key may reference a primary key or an equally typed unique column. Immediate checks use the latest committed state overlaid with the current transaction’s writes. Every commit rechecks affected constraints against that view. Constraint failure leaves the transaction active for repair or rollback. A durable identity consists of the client and request of a successful `COMMIT`. Repeating that command with the same identity from an idle session returns the original sequence and write count with `replayed=true`.
 
-## Storage v1
+## Storage
 
-`journal.v1` starts with `LOCKMERE<TAB>1`, a store identity, a canonical schema, and a `DATA` separator. Each committed transaction has one newline-terminated frame. Frames store the sequence, transaction identity, optional durable request, sorted row changes, and a footer with the sequence, payload byte length, and CRC-32. Integers are decimal, text uses lowercase UTF-8 hex, and deletion uses a tombstone.
+`journal.v1` starts with `LOCKMERE<TAB>1`, a store identity, a canonical schema, and a `DATA` separator. Each committed transaction appends one frame, and a single journal mixes two frame kinds in commit order.
 
-The engine synchronizes each frame before publishing its versions and receipt. An incomplete final frame is truncated on open. A malformed complete frame errors with its byte offset. An exclusive file lease prevents concurrent opens. The optional checkpoint carries current row heads, committed identities, and durable requests. It binds to the journal’s store identity and exact last included frame. Checkpoint creation writes and synchronizes a temporary file, atomically replaces the previous checkpoint, and synchronizes the directory. Open applies the journal suffix after that anchor. The full append-only journal stays available to `SHOW HISTORY`. Checkpointing can collect old in-memory versions once active snapshots no longer require them.
+New commits use the compact v2 binary frame: an `L2` tag, a varint payload length, a binary payload, and a CRC-32 trailer. The payload stores the sequence and transaction as varints, the optional durable request, and the sorted row changes with tagged values; integers use zigzag varints and text is length-prefixed UTF-8. Frames written by older versions are v1 text records: newline-terminated, storing the sequence, transaction identity, optional durable request, sorted row changes, and a footer with the sequence, payload byte length, and CRC-32. There integers are decimal, text uses lowercase UTF-8 hex, and deletion uses a tombstone. V1 frames are never rewritten; readers dispatch on the first byte of each frame, and replay, `SHOW HISTORY`, and durable receipts treat both kinds as one commit sequence.
+
+The engine synchronizes each frame before publishing its versions and receipt. An incomplete final frame of either kind is truncated on open. A malformed complete frame errors with its byte offset. An exclusive file lease prevents concurrent opens. The optional checkpoint carries current row heads, committed identities, and durable requests. It binds to the journal’s store identity and exact last included frame. Checkpoint creation writes and synchronizes a temporary file, atomically replaces the previous checkpoint, and synchronizes the directory. Open applies the journal suffix after that anchor. The full append-only journal stays available to `SHOW HISTORY`. Checkpointing can collect old in-memory versions once active snapshots no longer require them.
 
 The Rust `FaultInjector` supports three boundaries around append and checkpoint publication. A failed append or interrupted publication makes the open engine unavailable. Reopening reconstructs the last durable commit and its request receipt. The native recovery tests exercise a child process that exits after the journal sync.
 
@@ -74,6 +76,6 @@ Use a new directory per demo. The schedule parks a write behind a serial range r
 - `src/rows` merges MVCC histories with pending changes in primary-key order.
 - `src/locks` owns predicate grants, conflicting queues and deadlock evidence.
 - `src/constraints` validates canonical schema and evaluates immediate or deferred checks.
-- `src/wal` implements v1 framing, receipt persistence, checkpoints and recovery.
+- `src/wal` implements v1/v2 framing, receipt persistence, checkpoints and recovery.
 - `src/session` implements the SQL parser, request identity, result encoding and transports.
 - `src/scenario.rs` executes deterministic multi-client fences against the session interface.

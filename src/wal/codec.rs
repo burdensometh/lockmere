@@ -8,6 +8,48 @@ use crate::{
 pub(crate) const MAX_LINE: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_CHECKPOINT: u64 = 512 * 1024 * 1024;
 
+/// Tag starting a compact v2 commit frame. V1 text frames always begin with
+/// `C`, so the first byte of a frame selects its format.
+pub(crate) const V2_MAGIC: [u8; 2] = *b"L2";
+
+pub(crate) fn write_varint(output: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let mut byte = (value as u8) & 0x7f;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        output.push(byte);
+        if value == 0 {
+            return;
+        }
+    }
+}
+
+pub(crate) fn read_varint(input: &[u8]) -> std::result::Result<(u64, usize), String> {
+    let mut result = 0u64;
+    let mut shift = 0u32;
+    for (index, &byte) in input.iter().enumerate() {
+        let low = u64::from(byte & 0x7f);
+        if shift >= 64 || (shift == 63 && low > 1) {
+            return Err("varint exceeds 64 bits".to_owned());
+        }
+        result |= low << shift;
+        if byte & 0x80 == 0 {
+            if index > 0 && low == 0 {
+                return Err("noncanonical varint".to_owned());
+            }
+            return Ok((result, index + 1));
+        }
+        shift += 7;
+    }
+    Err("truncated varint".to_owned())
+}
+
+pub(crate) fn write_zigzag(output: &mut Vec<u8>, value: i64) {
+    write_varint(output, ((value << 1) ^ (value >> 63)) as u64);
+}
+
 pub(crate) fn num<T>(text: &str) -> std::result::Result<T, String>
 where
     T: std::str::FromStr + ToString,
@@ -201,7 +243,7 @@ const fn crc_table() -> [u32; 256] {
     table
 }
 
-fn checksum(bytes: &[u8]) -> u32 {
+pub(crate) fn checksum(bytes: &[u8]) -> u32 {
     !bytes.iter().fold(u32::MAX, |state, byte| {
         let index = ((state ^ u32::from(*byte)) & 0xff) as usize;
         (state >> 8) ^ CRC_TABLE[index]
