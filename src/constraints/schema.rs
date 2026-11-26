@@ -3,6 +3,35 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::error::{Error, Result};
 use crate::rows::{KeyKind, ReadInterval, Row, RowId, Value};
 
+/// Row-shape failure shared by the live write path and durable replay.
+///
+/// Every row accepted by the engine passes through [`Schema::validate_fields`],
+/// so type and unknown-column rejections carry the same [`Error`] on every
+/// path. Replay additionally requires complete canonical rows; that structural
+/// rejection is reported separately so the durable layer can wrap it with the
+/// originating file and byte offset instead of fabricating one.
+#[derive(Debug)]
+pub(crate) enum RowShape {
+    Rejected(Error),
+    MissingColumn,
+}
+
+impl RowShape {
+    pub(crate) fn message_for(self, row: &RowId) -> String {
+        match self {
+            Self::Rejected(error) => error.to_string(),
+            Self::MissingColumn => format!("row {row} omits a canonical column"),
+        }
+    }
+
+    pub(crate) fn checkpoint_message(self, row: &RowId) -> String {
+        match self {
+            Self::Rejected(error) => error.to_string(),
+            Self::MissingColumn => format!("checkpoint row {row} omits a canonical column"),
+        }
+    }
+}
+
 pub const PRIMARY_KEY: &str = "id";
 pub(crate) const MAX_IDENTIFIER: usize = 64;
 pub(crate) const MAX_TEXT_BYTES: usize = 64 * 1024;
@@ -288,6 +317,9 @@ impl Schema {
         Ok(())
     }
 
+    /// Validates a complete row supplied by an insert and fills every missing
+    /// nullable column with [`Value::Null`]. A missing required column or a
+    /// value whose type does not match the schema rejects the statement.
     pub fn normalize_row(&self, id: &RowId, mut values: Row) -> Result<Row> {
         self.validate_fields(id, &values)?;
         for (name, column) in &self.table(&id.table)?.columns {
@@ -302,6 +334,39 @@ impl Schema {
             }
         }
         Ok(values)
+    }
+
+    /// Applies a partial update patch over an existing canonical row.
+    ///
+    /// Columns absent from the patch keep their previous committed or pending
+    /// value. The patch itself is checked against the exact same column rules
+    /// as an insert before it can overwrite anything.
+    pub fn merge_update(&self, id: &RowId, current: &Row, mut patch: Row) -> Result<Row> {
+        self.validate_fields(id, &patch)?;
+        let mut merged = current.clone();
+        merged.append(&mut patch);
+        Ok(merged)
+    }
+
+    /// Enforces the full-row contract of a durable record recovered from the
+    /// journal or a checkpoint. Unlike [`Schema::normalize_row`] this never
+    /// invents a value: a persisted row must already name every schema column,
+    /// and every value must satisfy the shared column rules.
+    pub(crate) fn check_durable_row(
+        &self,
+        id: &RowId,
+        values: &Row,
+    ) -> std::result::Result<(), RowShape> {
+        if let Err(error) = self.validate_fields(id, values) {
+            return Err(RowShape::Rejected(error));
+        }
+        let table = self.table(&id.table).map_err(RowShape::Rejected)?;
+        for name in table.columns.keys() {
+            if !values.contains_key(name) {
+                return Err(RowShape::MissingColumn);
+            }
+        }
+        Ok(())
     }
 
     pub fn validate_fields(&self, id: &RowId, fields: &Row) -> Result<()> {

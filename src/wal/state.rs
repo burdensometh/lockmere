@@ -35,12 +35,8 @@ impl DurableState {
                 .map_err(|error| error.to_string())?;
             let previous = self.index.latest(&change.id);
             if let Some(values) = &change.values {
-                if schema
-                    .normalize_row(&change.id, values.clone())
-                    .map_err(|error| error.to_string())?
-                    != *values
-                {
-                    return Err(format!("row {} omits a canonical column", change.id));
+                if let Err(shape) = schema.check_durable_row(&change.id, values) {
+                    return Err(shape.message_for(&change.id));
                 }
             } else if !previous.is_some_and(|version| version.values.is_some()) {
                 return Err(format!("journal deletes missing row {}", change.id));

@@ -331,3 +331,70 @@ fn append(path: &Path, bytes: &[u8]) {
     file.write_all(bytes).unwrap();
     file.sync_all().unwrap();
 }
+
+#[test]
+fn replay_rejects_durable_row_missing_a_canonical_column_with_file_and_offset() {
+    let scratch = Scratch::new();
+    let path = scratch.db();
+    let file = path.join(JOURNAL_FILE);
+    {
+        let db = engine(&path);
+        seed(&db);
+    }
+    let offset = fs::metadata(&file).unwrap().len();
+    // badge requires both branch_id and note; the durable row names neither.
+    let frame = commit_frame(2, "U");
+    append(&file, frame.as_bytes());
+    assert!(
+        matches!(
+            Engine::open(&path, Options::default()),
+            Err(Error::Corrupt { file: JOURNAL_FILE, offset: at, .. }) if at == offset
+        ),
+        "replay must keep the journal file and byte offset"
+    );
+}
+
+#[test]
+fn replay_rejects_durable_row_whose_value_type_disagrees_with_the_schema() {
+    let scratch = Scratch::new();
+    let path = scratch.db();
+    let file = path.join(JOURNAL_FILE);
+    {
+        let db = engine(&path);
+        seed(&db);
+    }
+    let offset = fs::metadata(&file).unwrap().len();
+    // branch_id is INT NOT NULL but the frame stores a text value.
+    let frame = commit_frame(2, "U,branch_id=S7a,note=N");
+    append(&file, frame.as_bytes());
+    assert!(
+        matches!(
+            Engine::open(&path, Options::default()),
+            Err(Error::Corrupt { file: JOURNAL_FILE, offset: at, .. }) if at == offset
+        ),
+        "type violations must surface at the frame's offset"
+    );
+}
+
+fn commit_frame(sequence: u64, row: &str) -> String {
+    let payload = format!("C\t{sequence}\t9\t-\t-\t1\tbadge:I7a:{row}\tE{sequence}");
+    let crc = crc32(payload.as_bytes());
+    format!("{payload}\t#{}:{crc:08x}\n", payload.len())
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut table = [0u32; 256];
+    for (entry, slot) in table.iter_mut().enumerate() {
+        let mut value = entry as u32;
+        for _ in 0..8 {
+            value = (value >> 1) ^ if value & 1 == 0 { 0 } else { 0xedb88320 };
+        }
+        *slot = value;
+    }
+    let mut crc = u32::MAX;
+    for byte in bytes {
+        let index = ((crc ^ u32::from(*byte)) & 0xff) as usize;
+        crc = (crc >> 8) ^ table[index];
+    }
+    !crc
+}

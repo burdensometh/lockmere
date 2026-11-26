@@ -90,9 +90,7 @@ impl Workspace {
             (Change::Insert(row), None) => Some(context.schema.normalize_row(id, row)?),
             (Change::Insert(_), Some(_)) => return Err(Error::DuplicateKey(id.clone())),
             (Change::Update(patch), Some(values)) => {
-                let mut merged = values.clone();
-                merged.extend(patch);
-                Some(merged)
+                Some(context.schema.merge_update(id, &values, patch)?)
             }
             (Change::Delete, Some(_)) => None,
             (Change::Update(_) | Change::Delete, None) => {

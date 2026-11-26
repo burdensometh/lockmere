@@ -243,13 +243,9 @@ fn decode_head(
     schema.validate_id(&id).map_err(|error| error.to_string())?;
     let values = codec::decode_row(values)?;
     if let Some(row) = &values {
-        if schema
-            .normalize_row(&id, row.clone())
-            .map_err(|error| error.to_string())?
-            != *row
-        {
-            return Err(format!("checkpoint row {id} omits a canonical column"));
-        }
+        schema
+            .check_durable_row(&id, row)
+            .map_err(|shape| shape.checkpoint_message(&id))?;
     }
     let version = RowVersion::new(codec::num(seq)?, codec::num(tx)?, values);
     Ok((id, version))

@@ -10,9 +10,9 @@ use std::{
 use lockmere::{
     constraints::{CheckOutcome, Phase},
     locks::Blocker,
-    ConstraintMode, Error, Event,
+    ConstraintMode, Engine, Error, Event,
     Isolation::{Serializable, Snapshot},
-    Key, Operation, OperationResult, ReadInterval, Row, RowId, Step, Value,
+    Key, Operation, OperationResult, Options, ReadInterval, Record, Row, RowId, Step, Value,
 };
 
 use support::{badge, branch, engine, get, seed, Scratch};
@@ -413,4 +413,85 @@ fn pending_insert_deleted_before_commit_emits_no_invalid_tombstone() {
     db.execute(tx, Operation::Commit(None)).unwrap();
     assert!(db.history(0, 1).unwrap()[0].changes.is_empty());
     assert_eq!(Key::from(9), Key::Integer(9));
+}
+
+#[test]
+fn insert_fills_missing_nullable_columns_but_keeps_required_columns_strict() {
+    let root = Scratch::new();
+    let db = engine(root.db());
+    let tx = db.begin(Snapshot).unwrap().id;
+    // `note` is nullable and omitted: it must be stored as NULL.
+    db.execute(tx, badge("plain", 1)).unwrap();
+    assert_eq!(
+        get(&db, tx, RowId::new("badge", "plain")).unwrap().values["note"],
+        Value::Null
+    );
+    // `code` is required on branch: omitting it stays a statement-level error.
+    let missing_required = Operation::Insert(Record::new(RowId::new("branch", 7), Row::new()));
+    assert!(matches!(
+        db.execute(tx, missing_required),
+        Err(Error::InvalidValue(_))
+    ));
+    // A value whose type does not match the column is rejected the same way.
+    let bad_type = Operation::Insert(Record::new(
+        RowId::new("branch", 8),
+        Row::from([("code".to_owned(), 42.into())]),
+    ));
+    assert!(matches!(
+        db.execute(tx, bad_type),
+        Err(Error::InvalidValue(_))
+    ));
+    let unknown = Operation::Insert(Record::new(
+        RowId::new("branch", 9),
+        Row::from([("ghost".to_owned(), "x".into())]),
+    ));
+    assert!(matches!(
+        db.execute(tx, unknown),
+        Err(Error::UnknownColumn { .. })
+    ));
+    db.rollback(tx).unwrap();
+}
+
+#[test]
+fn partial_update_retains_untouched_columns_through_commit_and_reopen() {
+    let root = Scratch::new();
+    let path = root.db();
+    let db = engine(&path);
+    let tx = db.begin(Snapshot).unwrap().id;
+    db.execute(tx, badge("keep", 3)).unwrap();
+    db.execute(tx, branch(3, "third")).unwrap();
+    db.execute(tx, Operation::Commit(None)).unwrap();
+
+    let writer = db.begin(Snapshot).unwrap().id;
+    db.execute(
+        writer,
+        Operation::Update {
+            id: RowId::new("badge", "keep"),
+            patch: Row::from([("note".to_owned(), "annotated".into())]),
+        },
+    )
+    .unwrap();
+    let row = get(&db, writer, RowId::new("badge", "keep")).unwrap();
+    assert_eq!(row.values["branch_id"], 3.into());
+    assert_eq!(row.values["note"], "annotated".into());
+    // A typed-wrong patch cannot overwrite the old values.
+    let bad_patch = Operation::Update {
+        id: RowId::new("badge", "keep"),
+        patch: Row::from([("branch_id".to_owned(), "not-an-int".into())]),
+    };
+    assert!(matches!(
+        db.execute(writer, bad_patch),
+        Err(Error::InvalidValue(_))
+    ));
+    let row = get(&db, writer, RowId::new("badge", "keep")).unwrap();
+    assert_eq!(row.values["branch_id"], 3.into());
+    db.execute(writer, Operation::Commit(None)).unwrap();
+    drop(db);
+
+    let reopened = Engine::open(&path, Options::default()).unwrap();
+    let reader = reopened.begin(Snapshot).unwrap().id;
+    let row = get(&reopened, reader, RowId::new("badge", "keep")).unwrap();
+    assert_eq!(row.values["branch_id"], 3.into());
+    assert_eq!(row.values["note"], "annotated".into());
+    reopened.rollback(reader).unwrap();
 }
