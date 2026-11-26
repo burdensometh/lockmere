@@ -10,6 +10,7 @@ use crate::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Isolation {
+    ReadCommitted,
     Snapshot,
     Serializable,
 }
@@ -17,6 +18,7 @@ pub enum Isolation {
 impl Isolation {
     pub fn name(self) -> &'static str {
         match self {
+            Self::ReadCommitted => "read_committed",
             Self::Snapshot => "snapshot",
             Self::Serializable => "serializable",
         }

@@ -96,7 +96,12 @@ impl Parser {
             _ => match self.word()?.as_str() {
                 "snapshot" => Isolation::Snapshot,
                 "serializable" => Isolation::Serializable,
-                _ => return Err(self.error("expected SNAPSHOT or SERIALIZABLE")),
+                "read_committed" => Isolation::ReadCommitted,
+                "read" => {
+                    self.expect_word("committed")?;
+                    Isolation::ReadCommitted
+                }
+                _ => return Err(self.error("expected SNAPSHOT, SERIALIZABLE, or READ COMMITTED")),
             },
         };
         Ok(Command::Begin(isolation))

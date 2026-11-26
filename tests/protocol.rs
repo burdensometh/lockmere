@@ -10,7 +10,7 @@ use std::{
 
 use lockmere::{
     session::{encode_response, parse, run_console, Command as Sql, Response, Session},
-    Error, OperationResult,
+    Error, Isolation, OperationResult,
 };
 
 use support::{engine, Scratch};
@@ -30,6 +30,46 @@ fn parser_normalizes_bounds_and_rejects_mixed_types() {
     assert!(parse("UPDATE branch SET id=1 WHERE id=2").is_err());
     assert!(parse("GET badge 'not closed").is_err());
     assert!(parse("GET branch -9223372036854775808; -- signed lower bound").is_ok());
+}
+
+#[test]
+fn parser_accepts_read_committed_in_both_spellings() {
+    assert!(matches!(
+        parse("BEGIN READ COMMITTED"),
+        Ok(Sql::Begin(Isolation::ReadCommitted))
+    ));
+    assert!(matches!(
+        parse("begin transaction isolation level read committed;"),
+        Ok(Sql::Begin(Isolation::ReadCommitted))
+    ));
+    assert!(matches!(
+        parse("BEGIN READ_COMMITTED"),
+        Ok(Sql::Begin(Isolation::ReadCommitted))
+    ));
+    assert!(parse("BEGIN READ").is_err());
+    assert!(parse("BEGIN REPEATABLE READ").is_err());
+}
+
+#[test]
+fn read_committed_session_reports_isolation_and_sees_intermediate_commits() {
+    let root = Scratch::new();
+    let db = Arc::new(engine(root.db()));
+    let mut reader = Session::new(db.clone(), "reader").unwrap();
+    let mut writer = Session::new(db, "writer").unwrap();
+    reader.execute("begin", "BEGIN READ COMMITTED").unwrap();
+    let transaction = reader.transaction().unwrap();
+    let shown = reader.execute("show", "SHOW TRANSACTION").unwrap();
+    assert!(encode_response("show", &Ok(shown)).contains(r#""isolation":"read_committed""#));
+    writer.execute("begin", "BEGIN").unwrap();
+    writer
+        .execute("ins", "INSERT INTO branch (id, code) VALUES (1, 'north')")
+        .unwrap();
+    writer.execute("commit", "COMMIT").unwrap();
+    let seen = reader.execute("get", "GET branch 1").unwrap();
+    assert!(encode_response("get", &Ok(seen)).contains(r#""code":"north""#));
+    assert_eq!(reader.execute("end", "ROLLBACK").unwrap(), {
+        Response::RolledBack { id: transaction }
+    });
 }
 
 #[test]

@@ -72,20 +72,36 @@ impl Workspace {
         info
     }
 
+    /// The committed view a single statement reads from. Snapshot and
+    /// serializable transactions pin the sequence captured at `BEGIN`;
+    /// read-committed statements use the latest committed sequence at the
+    /// moment the statement runs (after any lock wait), so later statements
+    /// observe commits that landed in between.
+    pub fn read_view(&self, latest: Sequence) -> Sequence {
+        match self.info.isolation {
+            Isolation::ReadCommitted => latest,
+            _ => self.info.snapshot,
+        }
+    }
+
     pub fn stage(
         &mut self,
         context: &mut StatementContext<'_>,
         id: &RowId,
         change: Change,
     ) -> Result<()> {
-        let source = context.index.version_at(id, self.info.snapshot);
+        // A read-committed write bases itself on the committed row visible
+        // when its lock was acquired, so it never goes stale; the staleness
+        // check below then only fires for snapshot-pinned transactions.
+        let view = self.read_view(context.latest);
+        let source = context.index.version_at(id, view);
         let newest = context.index.latest(id);
         let base = source.map(|version| version.sequence);
         let latest = newest.map(|version| version.sequence);
         if base != latest {
             return Err(self.stale_write(id, newest));
         }
-        let current = context.index.read(id, self.info.snapshot, &self.intents);
+        let current = context.index.read(id, view, &self.intents);
         let values = match (change, current) {
             (Change::Insert(row), None) => Some(context.schema.normalize_row(id, row)?),
             (Change::Insert(_), Some(_)) => return Err(Error::DuplicateKey(id.clone())),

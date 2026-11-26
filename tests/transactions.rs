@@ -11,7 +11,7 @@ use lockmere::{
     constraints::{CheckOutcome, Phase},
     locks::Blocker,
     ConstraintMode, Error, Event,
-    Isolation::{Serializable, Snapshot},
+    Isolation::{ReadCommitted, Serializable, Snapshot},
     Key, Operation, OperationResult, ReadInterval, Row, RowId, Step, Value,
 };
 
@@ -413,4 +413,224 @@ fn pending_insert_deleted_before_commit_emits_no_invalid_tombstone() {
     db.execute(tx, Operation::Commit(None)).unwrap();
     assert!(db.history(0, 1).unwrap()[0].changes.is_empty());
     assert_eq!(Key::from(9), Key::Integer(9));
+}
+
+#[test]
+fn read_committed_statements_see_newly_committed_values() {
+    let root = Scratch::new();
+    let db = engine(root.db());
+    seed(&db);
+    let tx = db.begin(ReadCommitted).unwrap().id;
+    assert_eq!(
+        get(&db, tx, RowId::new("branch", 1)).unwrap().values["code"],
+        "north".into()
+    );
+    let writer = db.begin(Snapshot).unwrap().id;
+    db.execute(
+        writer,
+        Operation::Update {
+            id: RowId::new("branch", 1),
+            patch: Row::from([("code".to_owned(), "east".into())]),
+        },
+    )
+    .unwrap();
+    db.execute(writer, branch(4, "west")).unwrap();
+    db.execute(writer, Operation::Commit(None)).unwrap();
+    // The next point read and range read observe the intermediate commit.
+    assert_eq!(
+        get(&db, tx, RowId::new("branch", 1)).unwrap().values["code"],
+        "east".into()
+    );
+    let OperationResult::Rows(rows) = db
+        .execute(
+            tx,
+            Operation::Scan {
+                interval: ReadInterval::whole("branch"),
+                limit: 10,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("expected range rows");
+    };
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.id.key.clone())
+            .collect::<Vec<_>>(),
+        [1.into(), 2.into(), 4.into()]
+    );
+    db.rollback(tx).unwrap();
+}
+
+#[test]
+fn read_committed_pending_writes_overlay_the_latest_committed_view() {
+    let root = Scratch::new();
+    let db = engine(root.db());
+    seed(&db);
+    let tx = db.begin(ReadCommitted).unwrap().id;
+    db.execute(
+        tx,
+        Operation::Update {
+            id: RowId::new("branch", 1),
+            patch: Row::from([("code".to_owned(), "mine".into())]),
+        },
+    )
+    .unwrap();
+    let writer = db.begin(Snapshot).unwrap().id;
+    db.execute(
+        writer,
+        Operation::Update {
+            id: RowId::new("branch", 2),
+            patch: Row::from([("code".to_owned(), "their".into())]),
+        },
+    )
+    .unwrap();
+    db.execute(writer, Operation::Commit(None)).unwrap();
+    let OperationResult::Rows(rows) = db
+        .execute(
+            tx,
+            Operation::Scan {
+                interval: ReadInterval::whole("branch"),
+                limit: 10,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("expected range rows");
+    };
+    assert_eq!(rows[0].values["code"], "mine".into());
+    assert_eq!(rows[1].values["code"], "their".into());
+    db.execute(tx, Operation::Commit(None)).unwrap();
+}
+
+#[test]
+fn read_committed_reads_take_no_predicate_locks() {
+    let root = Scratch::new();
+    let db = engine(root.db());
+    seed(&db);
+    let reader = db.begin(ReadCommitted).unwrap().id;
+    let writer = db.begin(Snapshot).unwrap().id;
+    db.execute(
+        reader,
+        Operation::Scan {
+            interval: ReadInterval::whole("branch"),
+            limit: 10,
+        },
+    )
+    .unwrap();
+    assert!(get(&db, reader, RowId::new("branch", 1)).is_some());
+    assert!(matches!(
+        db.start(writer, branch(9, "free")),
+        Ok(Step::Complete(_))
+    ));
+    assert!(db.wait_graph().unwrap().edges().is_empty());
+    db.rollback(reader).unwrap();
+    db.rollback(writer).unwrap();
+}
+
+#[test]
+fn read_committed_waiting_update_applies_to_the_row_at_lock_acquisition() {
+    let root = Scratch::new();
+    let db = engine(root.db());
+    seed(&db);
+    let left = db.begin(Snapshot).unwrap().id;
+    let right = db.begin(ReadCommitted).unwrap().id;
+    db.execute(left, branch(7, "east")).unwrap();
+    // The row is absent from right's begin view, yet its update only waits.
+    let Step::Waiting(ticket) = db
+        .start(
+            right,
+            Operation::Update {
+                id: RowId::new("branch", 7),
+                patch: Row::from([("code".to_owned(), "west".into())]),
+            },
+        )
+        .unwrap()
+    else {
+        panic!("update must wait");
+    };
+    db.execute(left, Operation::Commit(None)).unwrap();
+    // After the wait the assignment lands on the newly committed row
+    // instead of failing with a stale snapshot or a missing row.
+    assert!(matches!(
+        db.resume(ticket),
+        Ok(Step::Complete(OperationResult::Changed { .. }))
+    ));
+    assert_eq!(
+        get(&db, right, RowId::new("branch", 7)).unwrap().values["code"],
+        "west".into()
+    );
+    db.execute(right, Operation::Commit(None)).unwrap();
+    assert_eq!(db.sequence().unwrap(), 3);
+}
+
+#[test]
+fn read_committed_waiting_update_merges_onto_the_newly_committed_row() {
+    let root = Scratch::new();
+    let db = engine(root.db());
+    seed(&db);
+    let left = db.begin(Snapshot).unwrap().id;
+    let right = db.begin(ReadCommitted).unwrap().id;
+    let row = RowId::new("badge", "seed");
+    db.execute(
+        left,
+        Operation::Update {
+            id: row.clone(),
+            patch: Row::from([("note".to_owned(), "left".into())]),
+        },
+    )
+    .unwrap();
+    let Step::Waiting(ticket) = db
+        .start(
+            right,
+            Operation::Update {
+                id: row.clone(),
+                patch: Row::from([("branch_id".to_owned(), 2.into())]),
+            },
+        )
+        .unwrap()
+    else {
+        panic!("update must wait");
+    };
+    db.execute(left, Operation::Commit(None)).unwrap();
+    assert!(matches!(db.resume(ticket), Ok(Step::Complete(_))));
+    let merged = get(&db, right, row).unwrap();
+    assert_eq!(merged.values["note"], "left".into());
+    assert_eq!(merged.values["branch_id"], 2.into());
+    db.execute(right, Operation::Commit(None)).unwrap();
+}
+
+#[test]
+fn read_committed_insert_after_wait_reports_duplicate_and_stays_active() {
+    let root = Scratch::new();
+    let db = engine(root.db());
+    let left = db.begin(Snapshot).unwrap().id;
+    let right = db.begin(ReadCommitted).unwrap().id;
+    db.execute(left, branch(7, "east")).unwrap();
+    let Step::Waiting(ticket) = db.start(right, branch(7, "west")).unwrap() else {
+        panic!("insert must wait");
+    };
+    db.execute(left, Operation::Commit(None)).unwrap();
+    assert!(
+        matches!(db.resume(ticket), Err(Error::DuplicateKey(id)) if id == RowId::new("branch", 7))
+    );
+    db.execute(right, branch(8, "south")).unwrap();
+    db.execute(right, Operation::Commit(None)).unwrap();
+}
+
+#[test]
+fn read_committed_delete_after_wait_observes_the_committed_tombstone() {
+    let root = Scratch::new();
+    let db = engine(root.db());
+    seed(&db);
+    let left = db.begin(Snapshot).unwrap().id;
+    let right = db.begin(ReadCommitted).unwrap().id;
+    let row = RowId::new("branch", 2);
+    db.execute(left, Operation::Delete(row.clone())).unwrap();
+    let Step::Waiting(ticket) = db.start(right, Operation::Delete(row.clone())).unwrap() else {
+        panic!("delete must wait");
+    };
+    db.execute(left, Operation::Commit(None)).unwrap();
+    assert!(matches!(db.resume(ticket), Err(Error::MissingRow(id)) if id == row));
+    db.rollback(right).unwrap();
 }

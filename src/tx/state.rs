@@ -402,17 +402,19 @@ fn execute_statement(
     match operation {
         Operation::Get(id) => {
             validate_read(tx, context, &ReadInterval::point(&id))?;
+            let view = tx.read_view(context.latest);
             let record = context
                 .index
-                .read(&id, tx.info.snapshot, &tx.intents)
+                .read(&id, view, &tx.intents)
                 .map(|values| Record::new(id, values.clone()));
             Ok(OperationResult::Row(record))
         }
         Operation::Scan { interval, limit } => {
             validate_read(tx, context, &interval)?;
+            let view = tx.read_view(context.latest);
             Ok(OperationResult::Rows(context.index.scan(
                 &interval,
-                tx.info.snapshot,
+                view,
                 &tx.intents,
                 limit,
             )))

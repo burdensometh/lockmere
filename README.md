@@ -28,7 +28,7 @@ TCP uses the same line protocol. Run `lockmere serve var/store 127.0.0.1:5057` a
 
 | Statement | Syntax |
 | --- | --- |
-| Begin | `BEGIN [TRANSACTION] [ISOLATION LEVEL] [SNAPSHOT\|SERIALIZABLE]` |
+| Begin | `BEGIN [TRANSACTION] [ISOLATION LEVEL] [READ COMMITTED\|SNAPSHOT\|SERIALIZABLE]` |
 | Point read | `GET table key` |
 | Range read | `SELECT * FROM table [WHERE id comparison key [AND ...]] [LIMIT n]` |
 | Insert | `INSERT INTO table (id, col, ...) VALUES (key, value, ...)` |
@@ -42,6 +42,8 @@ TCP uses the same line protocol. Run `lockmere serve var/store 127.0.0.1:5057` a
 Identifiers are case-insensitive in SQL and lowercase in schema files. Literals include signed 64-bit integers, single-quoted UTF-8 strings with doubled quotes, and `NULL` for nullable non-key fields. String keys use case-sensitive byte order. Scans return keys in ascending order. The comparisons are `=`, `<`, `<=`, `>`, `>=`. One statement can end in a semicolon. An omitted limit uses the configured scan maximum.
 
 Snapshot transactions pin the committed sequence at `BEGIN` and read their own writes. A write waits for an overlapping lock and then checks whether the key changed since its snapshot. Serializable transactions also acquire shared locks on point reads and on the full requested predicate, including missing rows and ranges returned with a limit. A reader whose predicate changed after its snapshot aborts with `SERIALIZATION`. For successful serializable transactions, the committed reads and writes agree with commit order. Snapshot clients can exhibit write skew.
+
+Read-committed transactions fix one committed view per statement: each statement reads the latest committed sequence at the moment it runs, overlaid with the transaction's own pending writes, so later statements observe commits that landed in between. A write that waits for a conflicting lock applies to the committed row visible when the lock is acquired, and therefore never fails with a stale-snapshot `SERIALIZATION` error. Read-committed statements take no predicate locks.
 
 Locks are released at transaction end. `ROLLBACK TO` restores pending writes and constraint modes and retains acquired locks. Waiters follow FIFO order among conflicting requests. A new request that closes a cycle aborts its own transaction. A lock timeout removes the waiting operation and keeps the transaction active. `SHOW LOCKS` distinguishes granted blockers from earlier waiters. `SHOW EVENTS` returns bounded event history with a cursor and reports constraint phases, waiting, readiness, commits, and aborts.
 
