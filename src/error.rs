@@ -112,16 +112,22 @@ impl Error {
     }
 
     pub fn ends_transaction(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Self::Deadlock { .. }
-                | Self::Serialization { .. }
-                | Self::UnknownTransaction(_)
-                | Self::StorageUnavailable
-                | Self::Injected(_)
-                | Self::Io { .. }
-                | Self::Corrupt { .. }
-        )
+            | Self::Serialization { .. }
+            | Self::UnknownTransaction(_)
+            | Self::StorageUnavailable
+            | Self::Io { .. }
+            | Self::Corrupt { .. } => true,
+            // A failed checkpoint publish only discards the temporary
+            // snapshot file; the journal and every active transaction are
+            // untouched, unlike a failed commit append, which poisons the
+            // engine and aborts all transactions.
+            Self::Injected(point) => {
+                *point != crate::wal::FaultPoint::BeforeCheckpointPublish.name()
+            }
+            _ => false,
+        }
     }
 }
 

@@ -256,6 +256,116 @@ fn failed_checkpoint_publish_retains_previous_anchor_and_tail() {
 }
 
 #[test]
+fn failed_checkpoint_publish_keeps_session_transaction_alive() {
+    let scratch = Scratch::new();
+    let path = scratch.db();
+    {
+        let db = engine(&path);
+        seed(&db);
+    }
+    let options = Options {
+        fault: Arc::new(FailAt(FaultPoint::BeforeCheckpointPublish)),
+        ..Options::default()
+    };
+    let db = Arc::new(Engine::open(&path, options).unwrap());
+    let mut session = Session::new(db.clone(), "checkpoint-client").unwrap();
+    session.execute("begin", "BEGIN SNAPSHOT").unwrap();
+    session
+        .execute(
+            "stage",
+            "INSERT INTO branch (id, code) VALUES (10, 'pending')",
+        )
+        .unwrap();
+    let failed = session.execute("publish", "CHECKPOINT");
+    assert!(matches!(
+        failed,
+        Err(Error::Injected("before_checkpoint_publish"))
+    ));
+    let encoded = lockmere::session::encode_response("publish", &failed);
+    assert!(
+        encoded.contains(r#""transaction_ended":false"#),
+        "checkpoint publish failure must not report the transaction as ended: {encoded}"
+    );
+    let shown = session.execute("show", "SHOW TRANSACTION").unwrap();
+    assert!(matches!(shown, Response::Transaction(info) if Some(info.id) == session.transaction()));
+    let row = session.execute("read", "GET branch 10").unwrap();
+    assert!(matches!(
+        row,
+        Response::Operation(OperationResult::Row(Some(_)))
+    ));
+    let committed = session.execute("finish", "COMMIT").unwrap();
+    assert!(matches!(
+        committed,
+        Response::Operation(OperationResult::Committed(_))
+    ));
+    assert_eq!(session.transaction(), None);
+
+    session.execute("begin-again", "BEGIN SNAPSHOT").unwrap();
+    session
+        .execute(
+            "stage-again",
+            "INSERT INTO branch (id, code) VALUES (11, 'discarded')",
+        )
+        .unwrap();
+    let failed = session.execute("publish-again", "CHECKPOINT");
+    assert!(matches!(
+        failed,
+        Err(Error::Injected("before_checkpoint_publish"))
+    ));
+    let encoded = lockmere::session::encode_response("publish-again", &failed);
+    assert!(encoded.contains(r#""transaction_ended":false"#));
+    let row = session.execute("read-again", "GET branch 11").unwrap();
+    assert!(matches!(
+        row,
+        Response::Operation(OperationResult::Row(Some(_)))
+    ));
+    session.execute("rollback", "ROLLBACK").unwrap();
+    assert_eq!(session.transaction(), None);
+    drop(session);
+    drop(db);
+
+    let db = Engine::open(&path, Options::default()).unwrap();
+    assert_eq!(db.sequence().unwrap(), 2);
+    let reader = db.begin(Snapshot).unwrap().id;
+    assert!(get(&db, reader, RowId::new("branch", 10)).is_some());
+    assert!(get(&db, reader, RowId::new("branch", 11)).is_none());
+}
+
+#[test]
+fn failed_commit_publish_still_reports_the_transaction_as_ended() {
+    let scratch = Scratch::new();
+    let path = scratch.db();
+    engine(&path);
+    let options = Options {
+        fault: Arc::new(FailAt(FaultPoint::BeforeAppend)),
+        ..Options::default()
+    };
+    let db = Arc::new(Engine::open(&path, options).unwrap());
+    let mut session = Session::new(db.clone(), "commit-client").unwrap();
+    session.execute("begin", "BEGIN SNAPSHOT").unwrap();
+    session
+        .execute("stage", "INSERT INTO branch (id, code) VALUES (10, 'lost')")
+        .unwrap();
+    let failed = session.execute("commit", "COMMIT");
+    assert!(matches!(failed, Err(Error::Injected("before_append"))));
+    let encoded = lockmere::session::encode_response("commit", &failed);
+    assert!(
+        encoded.contains(r#""transaction_ended":true"#),
+        "a genuine abort must still report the transaction as ended: {encoded}"
+    );
+    assert_eq!(session.transaction(), None);
+    drop(session);
+    drop(db);
+    assert_eq!(
+        Engine::open(&path, Options::default())
+            .unwrap()
+            .sequence()
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
 fn process_exit_between_wal_sync_and_publish_recovers_once() {
     let scratch = Scratch::new();
     let path = scratch.db();
