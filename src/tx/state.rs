@@ -174,6 +174,18 @@ impl State {
         self.journal.history(after, limit)
     }
 
+    /// Variant of [`Self::history`] that also reports the number of durable
+    /// frames decoded while serving the page, useful for asserting the tail
+    /// pagination bound.
+    pub fn history_measured(
+        &self,
+        after: Sequence,
+        limit: usize,
+    ) -> Result<(Vec<CommitLog>, usize)> {
+        self.available()?;
+        self.journal.history_measured(after, limit)
+    }
+
     pub fn checkpoint(&mut self, options: &Options) -> Result<CheckpointInfo> {
         self.available()?;
         let journal_bytes = self
@@ -283,7 +295,7 @@ impl State {
         hit(options, FaultPoint::BeforeAppend)?;
         if let Err(error) = self
             .journal
-            .append(&bytes)
+            .append(sequence, &bytes)
             .and_then(|()| hit(options, FaultPoint::AfterSyncBeforePublish))
         {
             self.poisoned = true;

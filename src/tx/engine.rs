@@ -149,6 +149,16 @@ impl Engine {
         self.guard()?.history(after, limit)
     }
 
+    /// Returns the history page together with the count of durable frames the
+    /// scan decoded. Intended for tests that pin the tail-pagination bound.
+    pub fn history_measured(
+        &self,
+        after: Sequence,
+        limit: usize,
+    ) -> Result<(Vec<CommitLog>, usize)> {
+        self.guard()?.history_measured(after, limit)
+    }
+
     fn guard(&self) -> Result<MutexGuard<'_, State>> {
         self.state.lock().map_err(|_| Error::StorageUnavailable)
     }

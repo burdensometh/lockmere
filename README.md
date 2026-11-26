@@ -53,6 +53,8 @@ Schema configuration defines tables and named single-column constraints. Unique 
 
 The engine synchronizes each frame before publishing its versions and receipt. An incomplete final frame is truncated on open. A malformed complete frame errors with its byte offset. An exclusive file lease prevents concurrent opens. The optional checkpoint carries current row heads, committed identities, and durable requests. It binds to the journal’s store identity and exact last included frame. Checkpoint creation writes and synchronizes a temporary file, atomically replaces the previous checkpoint, and synchronizes the directory. Open applies the journal suffix after that anchor. The full append-only journal stays available to `SHOW HISTORY`. Checkpointing can collect old in-memory versions once active snapshots no longer require them.
 
+`SHOW HISTORY` is served through a derived, sparse query index in `history.v1`. The sidecar never duplicates frame payloads: each entry records the byte offset at which a span of 246 commit frames begins, and the journal remains the source of truth. A tail read seeks to the newest span and keeps a bounded window of the requested page, while a cursor read seeks to the span owning the first frame after the cursor and stops once the page is full. Either shape decodes at most one span plus the page, so the strict bound is 256 decoded frames for any request, including the last ten rows of a hundred-thousand-commit journal, and every page is returned in ascending commit order. The index is maintained incrementally while appending and refreshed atomically at each span boundary. On open it is validated against the journal; a missing, stale, or corrupt sidecar is rebuilt in one journal scan and persisted again, without rewriting any journal frame, so an existing v1 store gains the index purely by being reopened. A torn journal tail is truncated before the index is built, leaving every indexed frame confirmed durable.
+
 The Rust `FaultInjector` supports three boundaries around append and checkpoint publication. A failed append or interrupted publication makes the open engine unavailable. Reopening reconstructs the last durable commit and its request receipt. The native recovery tests exercise a child process that exits after the journal sync.
 
 ## Replay and benchmarks
@@ -74,6 +76,6 @@ Use a new directory per demo. The schedule parks a write behind a serial range r
 - `src/rows` merges MVCC histories with pending changes in primary-key order.
 - `src/locks` owns predicate grants, conflicting queues and deadlock evidence.
 - `src/constraints` validates canonical schema and evaluates immediate or deferred checks.
-- `src/wal` implements v1 framing, receipt persistence, checkpoints and recovery.
+- `src/wal` implements v1 framing, receipt persistence, checkpoints, recovery and the sparse `history.v1` query index.
 - `src/session` implements the SQL parser, request identity, result encoding and transports.
 - `src/scenario.rs` executes deterministic multi-client fences against the session interface.

@@ -6,7 +6,9 @@ use std::{
 
 use super::{
     checkpoint::{self, Anchor},
-    codec, schema, CommitLog, DurableState, JOURNAL_FILE,
+    codec,
+    history::HistoryIndex,
+    schema, CommitLog, DurableState, JOURNAL_FILE,
 };
 use crate::{
     constraints::Schema,
@@ -56,6 +58,7 @@ pub(crate) struct Journal {
     data_start: u64,
     fingerprint: u64,
     anchor: Anchor,
+    history: HistoryIndex,
 }
 
 impl Journal {
@@ -84,7 +87,7 @@ impl Journal {
         Self::load(root, lease, true, expected)
     }
 
-    pub fn append(&mut self, bytes: &[u8]) -> Result<()> {
+    pub fn append(&mut self, sequence: Sequence, bytes: &[u8]) -> Result<()> {
         let end = codec::io_result("seek journal for append", self.file.seek(SeekFrom::End(0)))?;
         if end != self.anchor.end {
             return Err(Error::corrupt(
@@ -96,6 +99,11 @@ impl Journal {
         codec::io_result("append journal commit", self.file.write_all(bytes))?;
         codec::io_result("sync journal commit", self.file.sync_data())?;
         self.anchor = Anchor::record(end, bytes);
+        let span_boundary = self.history.observe(sequence, end, self.anchor.end)?;
+        if span_boundary {
+            // The index is derived data; refreshing it never rewrites the journal.
+            self.history.persist(&self.root)?;
+        }
         Ok(())
     }
 
@@ -111,22 +119,45 @@ impl Journal {
     }
 
     pub fn history(&self, after: Sequence, limit: usize) -> Result<Vec<CommitLog>> {
-        // The engine latch protects the live writer while the separate reader scans.
+        self.history_scan(after, limit).map(|(records, _)| records)
+    }
+
+    /// Same scan as [`Self::history`] but also reports how many durable frames
+    /// were decoded, so tests can pin the tail-pagination decode bound.
+    pub(crate) fn history_measured(
+        &self,
+        after: Sequence,
+        limit: usize,
+    ) -> Result<(Vec<CommitLog>, usize)> {
+        self.history_scan(after, limit)
+    }
+
+    fn history_scan(&self, after: Sequence, limit: usize) -> Result<(Vec<CommitLog>, usize)> {
+        // The engine latch protects the live writer while the separate reader
+        // scans. The sparse index seeks straight to the span that owns the
+        // requested page, so at most one span of frames plus the page itself is
+        // decoded, however long the journal is.
         let file = codec::io_result(
             "read journal history",
             File::open(self.root.join(JOURNAL_FILE)),
         )?;
         let mut reader = BufReader::new(file);
-        codec::io_result(
-            "seek history",
-            reader.seek(SeekFrom::Start(self.data_start)),
-        )?;
+        let start = self.history.start_offset(after);
+        codec::io_result("seek history", reader.seek(SeekFrom::Start(start)))?;
         let mut line = Vec::new();
-        let mut offset = self.data_start;
-        let mut expected = 1;
+        let mut offset = start;
+        let mut expected = self.expected_sequence_at(start)?;
+        let mut decoded = 0;
         let mut result = Vec::new();
-        while offset < self.anchor.end && result.len() < limit {
+        // Tail reads (no cursor) keep the newest `limit` matching frames in a
+        // bounded window; cursor reads stop as soon as their forward page is
+        // full. Both return frames in ascending commit order.
+        let tail = after == 0;
+        let mut window: std::collections::VecDeque<CommitLog> =
+            std::collections::VecDeque::with_capacity(limit + 1);
+        while offset < self.anchor.end {
             let record = read_required(&mut reader, &mut line, offset)?;
+            decoded += 1;
             if record.sequence != expected {
                 return Err(Error::corrupt(
                     JOURNAL_FILE,
@@ -135,12 +166,43 @@ impl Journal {
                 ));
             }
             if record.sequence > after {
-                result.push(record);
+                if tail {
+                    if window.len() == limit {
+                        window.pop_front();
+                    }
+                    window.push_back(record);
+                } else {
+                    result.push(record);
+                    if result.len() == limit {
+                        break;
+                    }
+                }
             }
             expected += 1;
             offset += line.len() as u64;
         }
-        Ok(result)
+        if tail {
+            Ok((window.into_iter().collect(), decoded))
+        } else {
+            Ok((result, decoded))
+        }
+    }
+
+    /// Sequence number of the frame beginning at `offset`, derived without
+    /// decoding any frame: index entries carry their own sequence and every
+    /// other scan starts at the first frame.
+    fn expected_sequence_at(&self, offset: u64) -> Result<Sequence> {
+        if offset == self.data_start {
+            return Ok(1);
+        }
+        let point = self.history.entry_sequence_at(offset).ok_or_else(|| {
+            Error::corrupt(
+                JOURNAL_FILE,
+                offset,
+                "history scan starts outside an indexed frame",
+            )
+        })?;
+        Ok(point)
     }
 
     fn load(
@@ -193,6 +255,9 @@ impl Journal {
             codec::io_result("truncate torn journal suffix", file.set_len(anchor.end))?;
             codec::io_result("sync recovered journal", file.sync_data())?;
         }
+        // The query index is fully derived from the journal: a missing or
+        // stale sidecar is built here without rewriting any journal frame.
+        let history = HistoryIndex::prepare(root, data_start, fingerprint, anchor)?;
         let journal = Self {
             root: root.to_path_buf(),
             file,
@@ -200,6 +265,7 @@ impl Journal {
             data_start,
             fingerprint,
             anchor,
+            history,
         };
         Ok((journal, schema, state))
     }
