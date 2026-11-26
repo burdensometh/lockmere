@@ -18,6 +18,7 @@ pub enum Error {
     StorageUnavailable,
     StoreInUse,
     StoreExists,
+    OrphanCheckpoint,
     InvalidSchema(String),
     SchemaMismatch,
     InvalidValue(String),
@@ -78,6 +79,7 @@ impl Error {
             Self::StorageUnavailable => "STORAGE_UNAVAILABLE",
             Self::StoreInUse => "STORE_IN_USE",
             Self::StoreExists => "STORE_EXISTS",
+            Self::OrphanCheckpoint => "ORPHAN_CHECKPOINT",
             Self::InvalidSchema(_) => "INVALID_SCHEMA",
             Self::SchemaMismatch => "SCHEMA_MISMATCH",
             Self::InvalidValue(_) => "INVALID_VALUE",
@@ -139,6 +141,12 @@ impl fmt::Display for Error {
             Self::StorageUnavailable => write!(output, "storage is unavailable until reopened"),
             Self::StoreInUse => write!(output, "database directory is already open"),
             Self::StoreExists => write!(output, "database already exists"),
+            Self::OrphanCheckpoint => write!(
+                output,
+                "refusing to initialize: {} is present without {}, so the checkpoint is orphaned",
+                crate::wal::CHECKPOINT_FILE,
+                crate::wal::JOURNAL_FILE
+            ),
             Self::InvalidSchema(message)
             | Self::InvalidValue(message)
             | Self::InvalidRequest(message) => output.write_str(message),

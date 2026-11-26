@@ -41,10 +41,12 @@ impl Drop for Scratch {
     }
 }
 
+pub fn schema() -> lockmere::Schema {
+    lockmere::session::parse_schema(include_str!("../../config/sample.schema")).unwrap()
+}
+
 pub fn engine(path: impl AsRef<Path>) -> Engine {
-    let schema =
-        lockmere::session::parse_schema(include_str!("../../config/sample.schema")).unwrap();
-    Engine::create(path, schema, Options::default()).unwrap()
+    Engine::create(path, schema(), Options::default()).unwrap()
 }
 
 pub fn branch(id: i64, code: &str) -> Operation {

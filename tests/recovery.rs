@@ -153,6 +153,86 @@ fn alternate_checkpoint_with_matching_schema_and_commit_shape_is_rejected() {
 }
 
 #[test]
+fn orphan_checkpoint_directory_is_refused_without_touching_its_bytes() {
+    let scratch = Scratch::new();
+    let path = scratch.db();
+    fs::create_dir(&path).unwrap();
+    let checkpoint = path.join(CHECKPOINT_FILE);
+    let snapshot = include_bytes!("../fixtures/v1/checkpoint.v1");
+    fs::write(&checkpoint, snapshot).unwrap();
+
+    let schema = support::schema();
+    let error = match Engine::create(&path, schema, Options::default()) {
+        Err(error) => error,
+        Ok(_) => panic!("orphan checkpoint directory must be refused"),
+    };
+    assert_eq!(error, Error::OrphanCheckpoint);
+    assert_eq!(error.code(), "ORPHAN_CHECKPOINT");
+
+    // The rejected initialization leaves every byte in place and creates
+    // neither a journal, a lease, nor any temporary files.
+    assert_eq!(fs::read(&checkpoint).unwrap(), snapshot);
+    assert!(!path.join(JOURNAL_FILE).exists());
+    assert!(!path.join(".lockmere.lock").exists());
+    assert!(!path.join(".journal.v1.initial").exists());
+    assert!(!path.join(".checkpoint.v1.temporary").exists());
+    assert_eq!(fs::read_dir(&path).unwrap().count(), 1);
+
+    // Once the matching journal is restored, the pair is a valid store again.
+    fs::write(
+        path.join(JOURNAL_FILE),
+        include_bytes!("../fixtures/v1/journal.v1"),
+    )
+    .unwrap();
+    let db = Engine::open(&path, Options::default()).unwrap();
+    assert_eq!(db.sequence().unwrap(), 4);
+}
+
+#[test]
+fn empty_and_nonexistent_directories_still_initialize() {
+    let scratch = Scratch::new();
+    let empty = scratch.path().join("empty");
+    fs::create_dir(&empty).unwrap();
+    let db = Engine::create(&empty, support::schema(), Options::default()).unwrap();
+    assert_eq!(db.sequence().unwrap(), 0);
+    drop(db);
+    let reopened = Engine::open(&empty, Options::default()).unwrap();
+    assert_eq!(reopened.sequence().unwrap(), 0);
+
+    let missing = scratch.path().join("missing");
+    Engine::create(&missing, support::schema(), Options::default()).unwrap();
+    assert!(missing.join(JOURNAL_FILE).is_file());
+}
+
+#[test]
+fn journal_checkpoint_pair_reopens_and_accepts_appended_commits() {
+    let scratch = Scratch::new();
+    let path = scratch.db();
+    fs::create_dir(&path).unwrap();
+    fs::write(
+        path.join(JOURNAL_FILE),
+        include_bytes!("../fixtures/v1/journal.v1"),
+    )
+    .unwrap();
+    fs::write(
+        path.join(CHECKPOINT_FILE),
+        include_bytes!("../fixtures/v1/checkpoint.v1"),
+    )
+    .unwrap();
+    {
+        let db = Engine::open(&path, Options::default()).unwrap();
+        let writer = db.begin(Snapshot).unwrap().id;
+        db.execute(writer, branch(9, "after_pair_open")).unwrap();
+        db.execute(writer, Operation::Commit(None)).unwrap();
+        assert_eq!(db.sequence().unwrap(), 5);
+        db.checkpoint().unwrap();
+    }
+    let db = Engine::open(&path, Options::default()).unwrap();
+    assert_eq!(db.sequence().unwrap(), 5);
+    assert_eq!(db.history(0, 10).unwrap().len(), 5);
+}
+
+#[test]
 fn database_lease_blocks_second_open_and_releases_on_drop() {
     let scratch = Scratch::new();
     let path = scratch.db();

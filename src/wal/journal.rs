@@ -6,7 +6,7 @@ use std::{
 
 use super::{
     checkpoint::{self, Anchor},
-    codec, schema, CommitLog, DurableState, JOURNAL_FILE,
+    codec, schema, CommitLog, DurableState, CHECKPOINT_FILE, JOURNAL_FILE,
 };
 use crate::{
     constraints::Schema,
@@ -60,6 +60,9 @@ pub(crate) struct Journal {
 
 impl Journal {
     pub fn create(root: &Path, schema: &Schema) -> Result<(Self, Schema, DurableState)> {
+        // Refuse before creating anything: a checkpoint without its journal is
+        // an orphan that a freshly initialized journal could never bind to.
+        reject_orphan_checkpoint(root)?;
         let header = schema::encode(schema, &new_identity()?)?;
         codec::io_result("create database directory", fs::create_dir_all(root))?;
         let lease = acquire_lease(root)?;
@@ -203,6 +206,17 @@ impl Journal {
         };
         Ok((journal, schema, state))
     }
+}
+
+fn reject_orphan_checkpoint(root: &Path) -> Result<()> {
+    let checkpoint = root.join(CHECKPOINT_FILE);
+    let journal = root.join(JOURNAL_FILE);
+    let has_checkpoint = codec::io_result("check checkpoint", checkpoint.try_exists())?;
+    let has_journal = codec::io_result("check journal", journal.try_exists())?;
+    if has_checkpoint && !has_journal {
+        return Err(Error::OrphanCheckpoint);
+    }
+    Ok(())
 }
 
 fn new_identity() -> Result<String> {
