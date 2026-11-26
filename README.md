@@ -29,6 +29,7 @@ TCP uses the same line protocol. Run `lockmere serve var/store 127.0.0.1:5057` a
 | Statement | Syntax |
 | --- | --- |
 | Begin | `BEGIN [TRANSACTION] [ISOLATION LEVEL] [SNAPSHOT\|SERIALIZABLE]` |
+| History view | `BEGIN [TRANSACTION] [ISOLATION LEVEL] [SNAPSHOT] AT sequence` |
 | Point read | `GET table key` |
 | Range read | `SELECT * FROM table [WHERE id comparison key [AND ...]] [LIMIT n]` |
 | Insert | `INSERT INTO table (id, col, ...) VALUES (key, value, ...)` |
@@ -42,6 +43,8 @@ TCP uses the same line protocol. Run `lockmere serve var/store 127.0.0.1:5057` a
 Identifiers are case-insensitive in SQL and lowercase in schema files. Literals include signed 64-bit integers, single-quoted UTF-8 strings with doubled quotes, and `NULL` for nullable non-key fields. String keys use case-sensitive byte order. Scans return keys in ascending order. The comparisons are `=`, `<`, `<=`, `>`, `>=`. One statement can end in a semicolon. An omitted limit uses the configured scan maximum.
 
 Snapshot transactions pin the committed sequence at `BEGIN` and read their own writes. A write waits for an overlapping lock and then checks whether the key changed since its snapshot. Serializable transactions also acquire shared locks on point reads and on the full requested predicate, including missing rows and ranges returned with a limit. A reader whose predicate changed after its snapshot aborts with `SERIALIZATION`. For successful serializable transactions, the committed reads and writes agree with commit order. Snapshot clients can exhibit write skew.
+
+A read-only history view is opened with `BEGIN ... AT n` and presents the committed store exactly as of sequence `n`. Point reads and range scans return the rows that genuinely existed at that order: an insert is absent before its commit, a delete is interpreted at the sequence where it became effective, and a later re-insert is visible only from its own commit. Sequence zero is the empty pre-commit view. A future or otherwise invalid sequence (greater than the latest durable commit) is rejected with `INVALID_SEQUENCE` and creates no view. History views take no locks and hold no pending writes; every write, savepoint, constraint or commit statement is rejected with `READ_ONLY_HISTORY` while the view stays open, so they never produce a new durable commit or request receipt. Each view rebuilds its index by replaying the journal prefix, so historical orders remain readable after a checkpoint collects old in-memory versions and after the store is reopened. Close a view with `ROLLBACK`; its `SHOW TRANSACTION` response carries `read_only=true`.
 
 Locks are released at transaction end. `ROLLBACK TO` restores pending writes and constraint modes and retains acquired locks. Waiters follow FIFO order among conflicting requests. A new request that closes a cycle aborts its own transaction. A lock timeout removes the waiting operation and keeps the transaction active. `SHOW LOCKS` distinguishes granted blockers from earlier waiters. `SHOW EVENTS` returns bounded event history with a cursor and reports constraint phases, waiting, readiness, commits, and aborts.
 

@@ -30,6 +30,15 @@ fn parser_normalizes_bounds_and_rejects_mixed_types() {
     assert!(parse("UPDATE branch SET id=1 WHERE id=2").is_err());
     assert!(parse("GET badge 'not closed").is_err());
     assert!(parse("GET branch -9223372036854775808; -- signed lower bound").is_ok());
+    assert!(matches!(
+        parse("BEGIN SNAPSHOT AT 4"),
+        Ok(Sql::BeginHistory { sequence: 4 })
+    ));
+    assert!(matches!(
+        parse("BEGIN AT 0;"),
+        Ok(Sql::BeginHistory { sequence: 0 })
+    ));
+    assert!(matches!(parse("BEGIN SERIALIZABLE"), Ok(Sql::Begin(_))));
 }
 
 #[test]

@@ -57,10 +57,18 @@ impl Engine {
         self.guard()?.begin(isolation, &self.options)
     }
 
+    pub fn begin_history(&self, sequence: Sequence) -> Result<TransactionInfo> {
+        self.guard()?.begin_history(sequence, &self.options)
+    }
+
     pub fn start(&self, id: TxId, operation: Operation) -> Result<Step> {
-        let result = self
-            .guard()?
-            .start(id, operation, &self.schema, &self.options);
+        let mut state = self.guard()?;
+        if state.is_history_view(id) {
+            return state
+                .history_read(id, &operation, &self.schema, &self.options)
+                .map(Step::Complete);
+        }
+        let result = state.start(id, operation, &self.schema, &self.options);
         self.wake.notify_all();
         result
     }

@@ -4,7 +4,7 @@ use crate::{
     constraints::Schema,
     error::{Error, Result},
     locks::{Acquire, LockManager, LockMode, LockRequest, WaitTicket},
-    rows::{ReadInterval, Record, Sequence, TxId},
+    rows::{PendingRows, ReadInterval, Record, RowIndex, Sequence, TxId},
     wal::{CommitLog, DurableState, FaultPoint},
 };
 
@@ -14,11 +14,24 @@ use super::{
     TransactionInfo,
 };
 
+/// A read-only view of the committed store as of one durable sequence.
+///
+/// The index is rebuilt by replaying the journal prefix, so it remains
+/// available after checkpoints collect old in-memory versions and after the
+/// store is reopened. A history view never takes locks, holds pending writes,
+/// or produces a durable commit.
+pub(crate) struct HistoryView {
+    snapshot: Sequence,
+    index: RowIndex,
+    reads: u64,
+}
+
 pub(crate) struct State {
     journal: crate::wal::Journal,
     pub durable: DurableState,
     pub locks: LockManager,
     transactions: BTreeMap<TxId, Workspace>,
+    history_views: BTreeMap<TxId, HistoryView>,
     events: VecDeque<(u64, Event)>,
     ready: Vec<WaitTicket>,
     newest_event: u64,
@@ -34,6 +47,7 @@ impl State {
             durable,
             locks: LockManager::default(),
             transactions: BTreeMap::new(),
+            history_views: BTreeMap::new(),
             ready: Vec::new(),
             events: VecDeque::new(),
             newest_event: 0,
@@ -64,6 +78,102 @@ impl State {
         self.transactions.insert(id, transaction);
         self.note(Event::Began(info.clone()), options);
         Ok(info)
+    }
+
+    pub fn begin_history(
+        &mut self,
+        sequence: Sequence,
+        options: &Options,
+    ) -> Result<TransactionInfo> {
+        self.available()?;
+        // Sequence zero is the empty pre-commit view; anything above the
+        // durable head is a future or otherwise invalid sequence.
+        if sequence > self.durable.sequence {
+            return Err(Error::InvalidSequence {
+                requested: sequence,
+                latest: self.durable.sequence,
+            });
+        }
+        if self.transactions.len() + self.history_views.len() >= options.max_transactions {
+            return Err(Error::Limit("active transactions"));
+        }
+        let id = self
+            .newest_transaction
+            .checked_add(1)
+            .ok_or(Error::Limit("transaction identity space"))?;
+        let index = self.journal.replay_until(sequence)?;
+        self.newest_transaction = id;
+        self.history_views.insert(
+            id,
+            HistoryView {
+                snapshot: sequence,
+                index,
+                reads: 0,
+            },
+        );
+        let info = TransactionInfo {
+            id,
+            snapshot: sequence,
+            isolation: Isolation::Snapshot,
+            writes: 0,
+            savepoints: 0,
+            reads: 0,
+            waiting: None,
+            read_only: true,
+        };
+        self.note(Event::Began(info.clone()), options);
+        Ok(info)
+    }
+
+    pub fn history_read(
+        &mut self,
+        id: TxId,
+        operation: &Operation,
+        schema: &Schema,
+        options: &Options,
+    ) -> Result<OperationResult> {
+        self.available()?;
+        let view = self
+            .history_views
+            .get_mut(&id)
+            .ok_or(Error::UnknownTransaction(id))?;
+        match operation {
+            Operation::Get(row) => {
+                schema.validate_id(row)?;
+                view.reads = view.reads.saturating_add(1);
+                let record = view
+                    .index
+                    .read(row, view.snapshot, &PendingRows::default())
+                    .map(|values| Record::new(row.clone(), values.clone()));
+                Ok(OperationResult::Row(record))
+            }
+            Operation::Scan { interval, limit } => {
+                schema.validate_interval(interval)?;
+                if *limit == 0 || *limit > options.max_scan {
+                    return Err(Error::Limit("scan rows"));
+                }
+                view.reads = view.reads.saturating_add(1);
+                Ok(OperationResult::Rows(view.index.scan(
+                    interval,
+                    view.snapshot,
+                    &PendingRows::default(),
+                    *limit,
+                )))
+            }
+            _ => Err(Error::ReadOnlyHistory(view.snapshot)),
+        }
+    }
+
+    pub fn close_history(&mut self, id: TxId) -> Result<()> {
+        self.available()?;
+        if self.history_views.remove(&id).is_none() {
+            return Err(Error::UnknownTransaction(id));
+        }
+        Ok(())
+    }
+
+    pub fn is_history_view(&self, id: TxId) -> bool {
+        self.history_views.contains_key(&id)
     }
 
     pub fn start(
@@ -154,6 +264,9 @@ impl State {
 
     pub fn rollback(&mut self, transaction: TxId, options: &Options) -> Result<()> {
         self.available()?;
+        if self.history_views.contains_key(&transaction) {
+            return self.close_history(transaction);
+        }
         if !self.transactions.contains_key(&transaction) {
             return Err(Error::UnknownTransaction(transaction));
         }
@@ -163,6 +276,18 @@ impl State {
 
     pub fn transaction(&self, transaction: TxId) -> Result<TransactionInfo> {
         self.available()?;
+        if let Some(view) = self.history_views.get(&transaction) {
+            return Ok(TransactionInfo {
+                id: transaction,
+                snapshot: view.snapshot,
+                isolation: Isolation::Snapshot,
+                writes: 0,
+                savepoints: 0,
+                reads: view.reads,
+                waiting: None,
+                read_only: true,
+            });
+        }
         self.transactions
             .get(&transaction)
             .map(Workspace::info)

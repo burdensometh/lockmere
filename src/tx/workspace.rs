@@ -55,6 +55,7 @@ impl Workspace {
                 savepoints: 0,
                 reads: 0,
                 waiting: None,
+                read_only: false,
             },
             intents: PendingRows::default(),
             parked: None,

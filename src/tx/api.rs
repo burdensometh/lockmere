@@ -131,8 +131,9 @@ pub struct TransactionInfo {
     pub isolation: Isolation,
     pub writes: usize,
     pub savepoints: usize,
-    pub reads: usize,
+    pub reads: u64,
     pub waiting: Option<WaitTicket>,
+    pub read_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

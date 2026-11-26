@@ -50,6 +50,11 @@ pub enum Error {
     NoTransaction,
     TransactionAlreadyOpen,
     DuplicateRequest,
+    InvalidSequence {
+        requested: u64,
+        latest: u64,
+    },
+    ReadOnlyHistory(u64),
     InvalidRequest(String),
     Limit(&'static str),
     Injected(&'static str),
@@ -98,6 +103,8 @@ impl Error {
             Self::NoTransaction => "NO_TRANSACTION",
             Self::TransactionAlreadyOpen => "TRANSACTION_ALREADY_OPEN",
             Self::DuplicateRequest => "DUPLICATE_REQUEST",
+            Self::InvalidSequence { .. } => "INVALID_SEQUENCE",
+            Self::ReadOnlyHistory(_) => "READ_ONLY_HISTORY",
             Self::InvalidRequest(_) => "INVALID_REQUEST",
             Self::Limit(_) => "LIMIT",
             Self::Injected(_) => "INJECTED",
@@ -170,6 +177,18 @@ impl fmt::Display for Error {
             Self::TransactionAlreadyOpen => write!(output, "a transaction is already active"),
             Self::DuplicateRequest => {
                 write!(output, "request identity already belongs to a commit")
+            }
+            Self::InvalidSequence { requested, latest } => {
+                write!(
+                    output,
+                    "history sequence {requested} is not a committed sequence (latest {latest})"
+                )
+            }
+            Self::ReadOnlyHistory(sequence) => {
+                write!(
+                    output,
+                    "history view at sequence {sequence} is read-only: only GET and SELECT are allowed"
+                )
             }
             Self::Limit(detail) => write!(output, "limit exceeded: {detail}"),
             Self::Injected(point) => write!(output, "fault injected at {point}"),

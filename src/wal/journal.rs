@@ -11,7 +11,7 @@ use super::{
 use crate::{
     constraints::Schema,
     error::{Error, Result},
-    rows::Sequence,
+    rows::{RowIndex, RowVersion, Sequence},
 };
 
 const LEASE: &str = ".lockmere.lock";
@@ -141,6 +141,50 @@ impl Journal {
             offset += line.len() as u64;
         }
         Ok(result)
+    }
+
+    /// Reconstruct the row versions visible at exactly `target` by replaying
+    /// the durable journal prefix. This reads committed frames straight from
+    /// disk, so it stays correct after checkpoints collect in-memory versions
+    /// and after the store is reopened. Callers must first prove `target` is a
+    /// committed sequence.
+    pub fn replay_until(&self, target: Sequence) -> Result<RowIndex> {
+        let file = codec::io_result(
+            "replay journal history",
+            File::open(self.root.join(JOURNAL_FILE)),
+        )?;
+        let mut reader = BufReader::new(file);
+        codec::io_result("seek replay", reader.seek(SeekFrom::Start(self.data_start)))?;
+        let mut index = RowIndex::new();
+        let mut line = Vec::new();
+        let mut offset = self.data_start;
+        let mut expected = 1;
+        while offset < self.anchor.end && expected <= target {
+            let record = read_required(&mut reader, &mut line, offset)?;
+            if record.sequence != expected {
+                return Err(Error::corrupt(
+                    JOURNAL_FILE,
+                    offset,
+                    "nonconsecutive commit in journal replay",
+                ));
+            }
+            for change in record.changes {
+                index.push(
+                    change.id,
+                    RowVersion::new(record.sequence, record.transaction, change.values),
+                );
+            }
+            expected += 1;
+            offset += line.len() as u64;
+        }
+        if expected != target + 1 {
+            return Err(Error::corrupt(
+                JOURNAL_FILE,
+                offset,
+                "journal replay ended before the requested sequence",
+            ));
+        }
+        Ok(index)
     }
 
     fn load(

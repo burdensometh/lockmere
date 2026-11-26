@@ -11,6 +11,9 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Begin(Isolation),
+    BeginHistory {
+        sequence: u64,
+    },
     Transaction(Operation),
     Select {
         interval: ReadInterval,
@@ -91,6 +94,11 @@ impl Parser {
         if self.keyword("isolation") {
             self.expect_word("level")?;
         }
+        // `BEGIN AT n` opens a read-only history view with the default level.
+        if self.keyword("at") {
+            let sequence = self.nonnegative()?;
+            return Ok(Command::BeginHistory { sequence });
+        }
         let isolation = match self.peek() {
             None | Some(Token::Semicolon) => Isolation::Serializable,
             _ => match self.word()?.as_str() {
@@ -99,6 +107,11 @@ impl Parser {
                 _ => return Err(self.error("expected SNAPSHOT or SERIALIZABLE")),
             },
         };
+        // `BEGIN SNAPSHOT AT n` pins the view at a committed sequence.
+        if self.keyword("at") {
+            let sequence = self.nonnegative()?;
+            return Ok(Command::BeginHistory { sequence });
+        }
         Ok(Command::Begin(isolation))
     }
 

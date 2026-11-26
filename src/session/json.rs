@@ -74,6 +74,7 @@ fn transaction(info: &TransactionInfo) -> String {
             "waiting",
             info.waiting.as_ref().map(wait).unwrap_or_else(null),
         ),
+        ("read_only", info.read_only.to_string()),
     ])
 }
 

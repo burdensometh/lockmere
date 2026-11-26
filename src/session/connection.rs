@@ -37,6 +37,7 @@ pub struct Session {
     engine: Arc<Engine>,
     active: Option<TxId>,
     waiting: Option<WaitTicket>,
+    history: bool,
 }
 
 impl Session {
@@ -48,6 +49,7 @@ impl Session {
             engine,
             active: None,
             waiting: None,
+            history: false,
         })
     }
 
@@ -71,6 +73,16 @@ impl Session {
                 }
                 let transaction = self.engine.begin(isolation)?;
                 self.active = Some(transaction.id);
+                self.history = false;
+                Ok(Response::Began(transaction))
+            }
+            Command::BeginHistory { sequence } => {
+                if self.active.is_some() {
+                    return Err(Error::TransactionAlreadyOpen);
+                }
+                let transaction = self.engine.begin_history(sequence)?;
+                self.active = Some(transaction.id);
+                self.history = true;
                 Ok(Response::Began(transaction))
             }
             Command::Transaction(operation) => self.start_operation(operation),
@@ -167,6 +179,7 @@ impl Session {
     fn clear(&mut self) {
         self.active = None;
         self.waiting = None;
+        self.history = false;
     }
 }
 
