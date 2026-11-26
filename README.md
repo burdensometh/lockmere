@@ -28,7 +28,7 @@ TCP uses the same line protocol. Run `lockmere serve var/store 127.0.0.1:5057` a
 
 | Statement | Syntax |
 | --- | --- |
-| Begin | `BEGIN [TRANSACTION] [ISOLATION LEVEL] [SNAPSHOT\|SERIALIZABLE]` |
+| Begin | `BEGIN [TRANSACTION] [ISOLATION LEVEL] [SNAPSHOT\|SERIALIZABLE] [PRIORITY n]` |
 | Point read | `GET table key` |
 | Range read | `SELECT * FROM table [WHERE id comparison key [AND ...]] [LIMIT n]` |
 | Insert | `INSERT INTO table (id, col, ...) VALUES (key, value, ...)` |
@@ -43,7 +43,7 @@ Identifiers are case-insensitive in SQL and lowercase in schema files. Literals 
 
 Snapshot transactions pin the committed sequence at `BEGIN` and read their own writes. A write waits for an overlapping lock and then checks whether the key changed since its snapshot. Serializable transactions also acquire shared locks on point reads and on the full requested predicate, including missing rows and ranges returned with a limit. A reader whose predicate changed after its snapshot aborts with `SERIALIZATION`. For successful serializable transactions, the committed reads and writes agree with commit order. Snapshot clients can exhibit write skew.
 
-Locks are released at transaction end. `ROLLBACK TO` restores pending writes and constraint modes and retains acquired locks. Waiters follow FIFO order among conflicting requests. A new request that closes a cycle aborts its own transaction. A lock timeout removes the waiting operation and keeps the transaction active. `SHOW LOCKS` distinguishes granted blockers from earlier waiters. `SHOW EVENTS` returns bounded event history with a cursor and reports constraint phases, waiting, readiness, commits, and aborts.
+Locks are released at transaction end. `ROLLBACK TO` restores pending writes and constraint modes and retains acquired locks. Waiters follow FIFO order among conflicting requests. A request whose wait would close a cycle detects the deadlock, chooses a victim, and tells every affected session. The victim is the lowest-priority transaction inside the actual wait cycle; an exact priority tie is settled by the fixed transaction order, aborting the later (higher-identity) transaction. When the victim is already queued behind another request, only that transaction terminates and its parked lock request is dropped, so unrelated waiters keep waiting for their original operation and a surviving requester can run immediately. `BEGIN ... PRIORITY n` sets a transaction's priority (default `0`); larger values are preserved. The `DEADLOCK` result names the actual `victim` and the `cycle`, even when the session that receives it was the queued victim rather than the requester. A lock timeout removes the waiting operation and keeps the transaction active. `SHOW LOCKS` distinguishes granted blockers from earlier waiters. `SHOW EVENTS` returns bounded event history with a cursor and reports constraint phases, waiting, readiness, commits, and aborts.
 
 Schema configuration defines tables and named single-column constraints. Unique and foreign-key participants are non-null. A foreign key may reference a primary key or an equally typed unique column. Immediate checks use the latest committed state overlaid with the current transaction’s writes. Every commit rechecks affected constraints against that view. Constraint failure leaves the transaction active for repair or rollback. A durable identity consists of the client and request of a successful `COMMIT`. Repeating that command with the same identity from an idle session returns the original sequence and write count with `replayed=true`.
 

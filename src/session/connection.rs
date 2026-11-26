@@ -65,11 +65,14 @@ impl Session {
             return Err(Error::DuplicateRequest);
         }
         match command {
-            Command::Begin(isolation) => {
+            Command::Begin {
+                isolation,
+                priority,
+            } => {
                 if self.active.is_some() {
                     return Err(Error::TransactionAlreadyOpen);
                 }
-                let transaction = self.engine.begin(isolation)?;
+                let transaction = self.engine.begin_with_priority(isolation, priority)?;
                 self.active = Some(transaction.id);
                 Ok(Response::Began(transaction))
             }

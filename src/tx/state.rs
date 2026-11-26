@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, VecDeque};
 use crate::{
     constraints::Schema,
     error::{Error, Result},
-    locks::{Acquire, LockManager, LockMode, LockRequest, WaitTicket},
+    locks::{Acquire, DeadlockVictim, LockManager, LockMode, LockRequest, Requester, WaitTicket},
     rows::{ReadInterval, Record, Sequence, TxId},
     wal::{CommitLog, DurableState, FaultPoint},
 };
@@ -21,6 +21,7 @@ pub(crate) struct State {
     transactions: BTreeMap<TxId, Workspace>,
     events: VecDeque<(u64, Event)>,
     ready: Vec<WaitTicket>,
+    resolved: BTreeMap<TxId, Error>,
     newest_event: u64,
     newest_transaction: TxId,
     poisoned: bool,
@@ -35,6 +36,7 @@ impl State {
             locks: LockManager::default(),
             transactions: BTreeMap::new(),
             ready: Vec::new(),
+            resolved: BTreeMap::new(),
             events: VecDeque::new(),
             newest_event: 0,
             poisoned: false,
@@ -49,7 +51,12 @@ impl State {
         }
     }
 
-    pub fn begin(&mut self, isolation: Isolation, options: &Options) -> Result<TransactionInfo> {
+    pub fn begin(
+        &mut self,
+        isolation: Isolation,
+        priority: i64,
+        options: &Options,
+    ) -> Result<TransactionInfo> {
         self.available()?;
         if self.transactions.len() >= options.max_transactions {
             return Err(Error::Limit("active transactions"));
@@ -59,7 +66,7 @@ impl State {
             .checked_add(1)
             .ok_or(Error::Limit("transaction identity space"))?;
         self.newest_transaction = id;
-        let transaction = Workspace::new(id, self.durable.sequence, isolation);
+        let transaction = Workspace::new(id, self.durable.sequence, isolation, priority);
         let info = transaction.info();
         self.transactions.insert(id, transaction);
         self.note(Event::Began(info.clone()), options);
@@ -81,31 +88,35 @@ impl State {
         if transaction.parked.is_some() {
             return Err(Error::TransactionBusy(id));
         }
-        let requested =
-            requested_lock(id, transaction.info.isolation, &operation, schema, options)?;
+        let isolation = transaction.info.isolation;
+        let priority = transaction.info.priority;
+        let requested = requested_lock(id, isolation, &operation, schema, options)?;
         if let Some(request) = requested {
             let interval = request.interval.clone();
-            match self.locks.enqueue(request)? {
+            match self.locks.enqueue_with_priority(request, priority)? {
                 Acquire::Granted => {}
                 Acquire::Waiting(ticket) => {
-                    let label = operation.label();
-                    self.transactions
-                        .get_mut(&id)
-                        .expect("active transaction")
-                        .parked = Some((ticket, operation));
-                    self.note(
-                        Event::Waiting {
-                            ticket,
-                            operation: label,
-                            interval,
-                        },
-                        options,
-                    );
+                    self.park(id, ticket, operation, interval, options);
                     return Ok(Step::Waiting(ticket));
                 }
-                Acquire::Deadlock(cycle) => {
-                    self.finish(id, Some("deadlock"), options);
-                    return Err(Error::Deadlock { victim: id, cycle });
+                Acquire::Deadlock { victims, requester } => {
+                    let requester_error = self.resolve_deadlock(id, victims, options);
+                    match requester {
+                        Requester::Granted => {
+                            return self
+                                .execute(id, operation, schema, options)
+                                .map(Step::Complete)
+                        }
+                        Requester::Victim => {
+                            self.finish(id, Some("deadlock"), options);
+                            return Err(requester_error.expect("the requester was the victim"));
+                        }
+                        Requester::Queued(ticket) => {
+                            self.park(id, ticket, operation, interval, options);
+                            self.update_ready(options);
+                            return Ok(Step::Waiting(ticket));
+                        }
+                    }
                 }
             }
         }
@@ -120,6 +131,11 @@ impl State {
         options: &Options,
     ) -> Result<Step> {
         self.available()?;
+        // A transaction aborted as a deadlock victim is no longer active, but its
+        // session still holds the wait ticket. Hand it the resolution here.
+        if let Some(error) = self.resolved.remove(&ticket.transaction) {
+            return Err(error);
+        }
         let tx = self
             .transactions
             .get_mut(&ticket.transaction)
@@ -135,6 +151,65 @@ impl State {
         self.update_ready(options);
         self.execute(ticket.transaction, operation, schema, options)
             .map(Step::Complete)
+    }
+
+    /// Parks the operation for `transaction` under `ticket` and records the wait.
+    fn park(
+        &mut self,
+        id: TxId,
+        ticket: WaitTicket,
+        operation: Operation,
+        interval: ReadInterval,
+        options: &Options,
+    ) {
+        let label = operation.label();
+        self.transactions
+            .get_mut(&id)
+            .expect("active transaction")
+            .parked = Some((ticket, operation));
+        self.note(
+            Event::Waiting {
+                ticket,
+                operation: label,
+                interval,
+            },
+            options,
+        );
+    }
+
+    /// Terminates every victim except the requester and records the outcome a
+    /// session needs. A victim that was parked under a wait ticket will receive
+    /// its `Deadlock` error when it next polls or waits. The requester's own
+    /// outcome is returned directly if it was the victim.
+    fn resolve_deadlock(
+        &mut self,
+        requester: TxId,
+        victims: Vec<DeadlockVictim>,
+        options: &Options,
+    ) -> Option<Error> {
+        let mut requester_error = None;
+        for victim in victims {
+            let transaction = victim.victim;
+            let error = Error::Deadlock {
+                victim: transaction,
+                cycle: victim.cycle,
+            };
+            if transaction == requester {
+                requester_error = Some(error);
+            } else {
+                let was_parked = self
+                    .transactions
+                    .get(&transaction)
+                    .is_some_and(|tx| tx.parked.is_some());
+                self.finish(transaction, Some("deadlock"), options);
+                // Keep the result keyed by transaction so its session learns the
+                // real victim when it next polls; the entry clears on that poll.
+                if was_parked {
+                    self.resolved.insert(transaction, error);
+                }
+            }
+        }
+        requester_error
     }
 
     pub fn timeout(&mut self, ticket: WaitTicket, options: &Options) -> Result<()> {
@@ -154,7 +229,11 @@ impl State {
 
     pub fn rollback(&mut self, transaction: TxId, options: &Options) -> Result<()> {
         self.available()?;
+        // A dropped session may roll back a transaction that was already aborted
+        // as a deadlock victim; discard any unread resolution so it cannot
+        // accumulate.
         if !self.transactions.contains_key(&transaction) {
+            self.resolved.remove(&transaction);
             return Err(Error::UnknownTransaction(transaction));
         }
         self.finish(transaction, Some("rollback"), options);

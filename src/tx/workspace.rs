@@ -45,12 +45,13 @@ pub(crate) enum Change {
 }
 
 impl Workspace {
-    pub fn new(id: TxId, snapshot: Sequence, isolation: Isolation) -> Self {
+    pub fn new(id: TxId, snapshot: Sequence, isolation: Isolation, priority: i64) -> Self {
         Self {
             info: TransactionInfo {
                 id,
                 snapshot,
                 isolation,
+                priority,
                 writes: 0,
                 savepoints: 0,
                 reads: 0,

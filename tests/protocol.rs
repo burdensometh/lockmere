@@ -33,6 +33,38 @@ fn parser_normalizes_bounds_and_rejects_mixed_types() {
 }
 
 #[test]
+fn parser_accepts_begin_priority_and_rejects_malformed_forms() {
+    assert!(matches!(
+        parse("BEGIN PRIORITY 7"),
+        Ok(Sql::Begin {
+            isolation: lockmere::Isolation::Serializable,
+            priority: 7,
+        })
+    ));
+    assert!(matches!(
+        parse("BEGIN SNAPSHOT PRIORITY -3"),
+        Ok(Sql::Begin {
+            isolation: lockmere::Isolation::Snapshot,
+            priority: -3,
+        })
+    ));
+    assert!(matches!(
+        parse("BEGIN ISOLATION LEVEL SERIALIZABLE PRIORITY 2"),
+        Ok(Sql::Begin { priority: 2, .. })
+    ));
+    assert!(matches!(
+        parse("BEGIN"),
+        Ok(Sql::Begin {
+            isolation: lockmere::Isolation::Serializable,
+            priority: 0,
+        })
+    ));
+    // A non-integer priority is a syntax error.
+    assert!(parse("BEGIN PRIORITY high").is_err());
+    assert!(parse("BEGIN PRIORITY").is_err());
+}
+
+#[test]
 fn console_returns_structured_results_and_recovers_after_malformed_request() {
     let root = Scratch::new();
     let db = Arc::new(engine(root.db()));
@@ -109,6 +141,57 @@ fn json_quotes_text_values_and_preserves_retry_fields() {
     assert!(
         encode_response("dead", &error).contains(r#""retryable":true,"transaction_ended":true"#)
     );
+}
+
+#[test]
+fn session_deadlock_names_the_actual_victim_and_cycle() {
+    let root = Scratch::new();
+    let db = Arc::new(engine(root.db()));
+    let mut low = Session::new(db.clone(), "low").unwrap();
+    let mut high = Session::new(db.clone(), "high").unwrap();
+    let low_tx = low
+        .execute("begin", "BEGIN SERIALIZABLE PRIORITY 1")
+        .map(|response| match response {
+            Response::Began(info) => info.id,
+            other => panic!("expected begin, got {other:?}"),
+        })
+        .unwrap();
+    let high_tx = high
+        .execute("begin", "BEGIN SERIALIZABLE PRIORITY 9")
+        .map(|response| match response {
+            Response::Began(info) => info.id,
+            other => panic!("expected begin, got {other:?}"),
+        })
+        .unwrap();
+    low.execute("a", "INSERT INTO branch (id, code) VALUES (1, 'low')")
+        .unwrap();
+    high.execute("a", "INSERT INTO branch (id, code) VALUES (2, 'high')")
+        .unwrap();
+    // The low priority transaction blocks on the high holder's row.
+    assert!(matches!(
+        low.start("b", "INSERT INTO branch (id, code) VALUES (2, 'low')"),
+        Ok(Response::Waiting(_))
+    ));
+    // The high priority requester closes the cycle. Only the queued low
+    // transaction is the victim, so the requester proceeds immediately.
+    assert!(matches!(
+        high.start("b", "INSERT INTO branch (id, code) VALUES (1, 'other')"),
+        Ok(Response::Operation(OperationResult::Changed { .. }))
+    ));
+    // The low session's parked wait reports the real victim and cycle.
+    let error = low.poll().unwrap_err();
+    assert_eq!(
+        error,
+        Error::Deadlock {
+            victim: low_tx,
+            cycle: vec![low_tx, high_tx, low_tx],
+        }
+    );
+    assert_eq!(low.transaction(), None);
+    assert!(matches!(
+        high.execute("c", "COMMIT"),
+        Ok(Response::Operation(OperationResult::Committed(_)))
+    ));
 }
 
 #[test]

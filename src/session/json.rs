@@ -67,6 +67,7 @@ fn transaction(info: &TransactionInfo) -> String {
         ("transaction", info.id.to_string()),
         ("snapshot", info.snapshot.to_string()),
         ("isolation", quoted(info.isolation.name())),
+        ("priority", info.priority.to_string()),
         ("writes", info.writes.to_string()),
         ("savepoints", info.savepoints.to_string()),
         ("reads", info.reads.to_string()),

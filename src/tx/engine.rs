@@ -54,7 +54,15 @@ impl Engine {
     }
 
     pub fn begin(&self, isolation: Isolation) -> Result<TransactionInfo> {
-        self.guard()?.begin(isolation, &self.options)
+        self.begin_with_priority(isolation, 0)
+    }
+
+    pub fn begin_with_priority(
+        &self,
+        isolation: Isolation,
+        priority: i64,
+    ) -> Result<TransactionInfo> {
+        self.guard()?.begin(isolation, priority, &self.options)
     }
 
     pub fn start(&self, id: TxId, operation: Operation) -> Result<Step> {

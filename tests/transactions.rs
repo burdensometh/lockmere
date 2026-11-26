@@ -229,6 +229,140 @@ fn closing_a_deadlock_cycle_aborts_requester_and_wakes_other_holder() {
 }
 
 #[test]
+fn priority_keeps_a_high_priority_requester_and_aborts_the_low_waiter() {
+    let root = Scratch::new();
+    let db = engine(root.db());
+    let low = db.begin_with_priority(Serializable, 1).unwrap().id;
+    let high = db.begin_with_priority(Serializable, 10).unwrap().id;
+    db.execute(low, branch(1, "low")).unwrap();
+    db.execute(high, branch(2, "high")).unwrap();
+    let Step::Waiting(low_ticket) = db.start(low, branch(2, "low_second")).unwrap() else {
+        panic!("low must wait on the high holder");
+    };
+    // The high priority requester closes the cycle. The lowest priority member
+    // is the already queued `low`, so only it is aborted and `high` continues.
+    assert!(matches!(
+        db.start(high, branch(1, "high_second")),
+        Ok(Step::Complete(_))
+    ));
+    assert_eq!(db.wait_graph().unwrap().edges().len(), 0);
+    assert_eq!(
+        db.resume(low_ticket),
+        Err(Error::Deadlock {
+            victim: low,
+            cycle: vec![low, high, low],
+        })
+    );
+    assert_eq!(db.transaction(low), Err(Error::UnknownTransaction(low)));
+    assert!(db.transaction(high).is_ok());
+    db.execute(high, Operation::Commit(None)).unwrap();
+}
+
+#[test]
+fn equal_priority_aborts_the_later_transaction_even_when_it_waits() {
+    let root = Scratch::new();
+    let db = engine(root.db());
+    let early = db.begin(Serializable).unwrap().id;
+    let late = db.begin(Serializable).unwrap().id;
+    db.execute(early, branch(1, "early")).unwrap();
+    db.execute(late, branch(2, "late")).unwrap();
+    let Step::Waiting(late_ticket) = db.start(late, branch(1, "late_second")).unwrap() else {
+        panic!("late must wait");
+    };
+    // The earlier transaction closes the cycle. Both priorities tie, so the
+    // fixed order makes the later transaction (already queued) the victim.
+    assert!(matches!(
+        db.start(early, branch(2, "early_second")),
+        Ok(Step::Complete(_))
+    ));
+    assert_eq!(
+        db.resume(late_ticket),
+        Err(Error::Deadlock {
+            victim: late,
+            cycle: vec![late, early, late],
+        })
+    );
+    assert_eq!(db.transaction(late), Err(Error::UnknownTransaction(late)));
+    db.execute(early, Operation::Commit(None)).unwrap();
+}
+
+#[test]
+fn a_deadlock_resolution_keeps_an_unrelated_waiter_for_its_original_request() {
+    let root = Scratch::new();
+    let db = engine(root.db());
+    let holder = db.begin(Serializable).unwrap().id;
+    let partner = db.begin(Serializable).unwrap().id;
+    let waiter = db.begin(Snapshot).unwrap().id;
+    db.execute(holder, branch(1, "held")).unwrap();
+    let Step::Waiting(waiter_ticket) = db.start(waiter, branch(1, "queued")).unwrap() else {
+        panic!("waiter must block behind the holder");
+    };
+    db.execute(holder, branch(2, "held_two")).unwrap();
+    db.execute(partner, branch(3, "partner")).unwrap();
+    let Step::Waiting(_) = db.start(holder, branch(3, "cycle")).unwrap() else {
+        panic!("holder must wait for the partner");
+    };
+    // The partner closes the cycle and is the later transaction, so it is the
+    // victim; the holder is granted and the unrelated waiter is untouched.
+    assert_eq!(
+        db.start(partner, branch(2, "close")),
+        Err(Error::Deadlock {
+            victim: partner,
+            cycle: vec![partner, holder, partner],
+        })
+    );
+    db.rollback(holder).unwrap();
+    assert!(matches!(
+        db.resume(waiter_ticket),
+        Ok(Step::Complete(OperationResult::Changed { .. }))
+    ));
+    assert_eq!(db.transaction(waiter).unwrap().writes, 1);
+    db.execute(waiter, Operation::Commit(None)).unwrap();
+    assert_eq!(db.sequence().unwrap(), 1);
+}
+
+#[test]
+fn a_blocked_thread_receives_the_deadlock_that_aborts_it() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let root = Scratch::new();
+    let db = Arc::new(engine(root.db()));
+    let low = db.begin_with_priority(Serializable, 0).unwrap().id;
+    let high = db.begin_with_priority(Serializable, 5).unwrap().id;
+    db.execute(low, branch(1, "low")).unwrap();
+    db.execute(high, branch(2, "high")).unwrap();
+    let Step::Waiting(ticket) = db.start(low, branch(2, "low_second")).unwrap() else {
+        panic!("low must wait");
+    };
+    let started = Arc::new(AtomicBool::new(false));
+    let waiter = {
+        let db = db.clone();
+        let started = started.clone();
+        thread::spawn(move || {
+            started.store(true, Ordering::SeqCst);
+            db.wait(ticket, Duration::from_secs(3))
+        })
+    };
+    while !started.load(Ordering::SeqCst) {
+        thread::yield_now();
+    }
+    // The high priority requester closes the cycle and must be granted, while
+    // the parked low transaction is aborted as the victim.
+    assert!(matches!(
+        db.start(high, branch(1, "high_second")),
+        Ok(Step::Complete(_))
+    ));
+    assert_eq!(
+        waiter.join().unwrap(),
+        Err(Error::Deadlock {
+            victim: low,
+            cycle: vec![low, high, low],
+        })
+    );
+    assert_eq!(db.transaction(low), Err(Error::UnknownTransaction(low)));
+    db.execute(high, Operation::Commit(None)).unwrap();
+}
+
+#[test]
 fn earlier_conflicting_waiters_cannot_be_overtaken() {
     let root = Scratch::new();
     let db = engine(root.db());

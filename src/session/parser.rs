@@ -10,7 +10,10 @@ use crate::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    Begin(Isolation),
+    Begin {
+        isolation: Isolation,
+        priority: i64,
+    },
     Transaction(Operation),
     Select {
         interval: ReadInterval,
@@ -93,13 +96,25 @@ impl Parser {
         }
         let isolation = match self.peek() {
             None | Some(Token::Semicolon) => Isolation::Serializable,
+            Some(Token::Word(word)) if word == "priority" => Isolation::Serializable,
             _ => match self.word()?.as_str() {
                 "snapshot" => Isolation::Snapshot,
                 "serializable" => Isolation::Serializable,
                 _ => return Err(self.error("expected SNAPSHOT or SERIALIZABLE")),
             },
         };
-        Ok(Command::Begin(isolation))
+        let mut priority = 0;
+        if self.keyword("priority") {
+            let offset = self.offset();
+            priority = match self.tokens.next().map(|item| item.token) {
+                Some(Token::Integer(value)) => value,
+                _ => return Err(lexer::syntax(offset, "expected a priority integer")),
+            };
+        }
+        Ok(Command::Begin {
+            isolation,
+            priority,
+        })
     }
 
     fn select(&mut self) -> Result<Command> {

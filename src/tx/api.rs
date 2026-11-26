@@ -129,6 +129,8 @@ pub struct TransactionInfo {
     pub id: TxId,
     pub snapshot: Sequence,
     pub isolation: Isolation,
+    /// Larger values are preserved when a wait cycle needs a victim.
+    pub priority: i64,
     pub writes: usize,
     pub savepoints: usize,
     pub reads: usize,
