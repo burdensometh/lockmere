@@ -1,0 +1,41 @@
+# Scenario C — a rejected commit is durable nowhere.
+# Before repair/rollback the failed transaction remains open and its own
+# pending row is readable (self-view). After an explicit ROLLBACK the tx and
+# its intents vanish. REOPEN rebuilds purely from committed journal frames, so
+# the sequence, history and row set never include the rejected commit.
+
+# One committed baseline parent.
+DO c base-begin OK BEGIN
+DO c base-branch OK INSERT INTO branch (id, code) VALUES (1, 'north')
+DO c base-commit OK COMMIT
+ASSERT_SEQUENCE 1
+
+# Open a tx and fail its deferred-FK commit.
+DO c bad-begin OK BEGIN
+DO c bad-badge OK INSERT INTO badge (id, branch_id) VALUES ('ghost', 40)
+DO c bad-commit CONSTRAINT_VIOLATION COMMIT
+
+# STILL ACTIVE before repair/rollback: the pending child row is self-visible,
+# yet history already proves no durable frame was appended for this attempt.
+DO c bad-show-tx OK SHOW TRANSACTION
+DO c bad-self-read OK GET badge 'ghost'
+DO c history-while-open OK SHOW HISTORY
+
+# Explicit rollback ends the failed tx and discards its intents and locks.
+DO c bad-rollback OK ROLLBACK
+
+# After rollback the child row is gone from a fresh transaction's view.
+DO v v-begin OK BEGIN
+DO v v-ghost-gone OK GET badge 'ghost'
+DO v v-history OK SHOW HISTORY
+DO v v-end OK ROLLBACK
+
+# Reopen reconstructs only durable commits; sequence stays at the baseline (1)
+# and there is still no trace of the rejected attempt.
+REOPEN
+DO r r-begin OK BEGIN
+DO r r-history OK SHOW HISTORY
+DO r r-branch OK GET branch 1
+DO r r-no-ghost OK GET badge 'ghost'
+DO r r-end OK ROLLBACK
+ASSERT_SEQUENCE 1

@@ -1,0 +1,57 @@
+# Scenario B — statement passes while the parent is visible; the parent is then
+# LEGALLY deleted and committed by a different transaction before our COMMIT.
+# Same deferrable-deferred FK badge_branch (badge.branch_id -> branch.id).
+#
+# Two real entry points are contrasted:
+#   write entry  : INSERT badge sees branch 2 present in the committed view,
+#                  statement-phase FK verdict is "deferred" (examined 0).
+#   commit entry : re-evaluation uses the LATEST committed sequence overlaid
+#                  with this tx's writes; another tx has removed branch 2, so
+#                  the verdict becomes missing_parent and COMMIT is refused.
+# Note the read-view split: a snapshot GET still sees the old parent, while the
+# commit gate deliberately checks the latest state.
+
+# Baseline: parents branch 1 and branch 2, both durably committed.
+DO c seed-begin OK BEGIN
+DO c seed-b1 OK INSERT INTO branch (id, code) VALUES (1, 'north')
+DO c seed-b2 OK INSERT INTO branch (id, code) VALUES (2, 'south')
+DO c seed-commit OK COMMIT
+ASSERT_SEQUENCE 1
+
+# P = the other transaction; it stages (does not yet publish) a delete of 2.
+DO p p-begin OK BEGIN SNAPSHOT
+DO p p-delete OK DELETE FROM branch WHERE id=2
+
+# C = our child transaction, snapshot pinned while branch 2 still exists.
+DO c c-begin OK BEGIN SNAPSHOT
+# WRITE ENTRY: parent branch 2 is visible to C right now.
+DO c c-read-parent-before OK GET branch 2
+DO c c-insert-child OK INSERT INTO badge (id, branch_id) VALUES ('arrived', 2)
+# Statement-phase FK check is deferred; the write is accepted.
+
+# P commits the legal parent delete first (commit order: P before C's attempt).
+DO p p-commit OK COMMIT
+ASSERT_SEQUENCE 2
+
+# Durable order captured while C is still open: seed(1), parent-delete(2).
+# There is no frame for C because C has not committed.
+DO o history-mid OK SHOW HISTORY
+
+# C's snapshot read still returns the deleted parent (snapshot-pinned view)...
+DO c c-read-parent-after OK GET branch 2
+# ...but the COMMIT gate checks the LATEST committed state, where 2 is gone.
+DO c c-commit-fail CONSTRAINT_VIOLATION COMMIT
+# The rejected commit leaves C active with its pending child write.
+DO c c-show-tx OK SHOW TRANSACTION
+
+# Repair inside C: insert a NEW parent key (9) absent from C's snapshot, so
+# only the FK path is exercised (re-inserting deleted key 2 would instead hit
+# the MVCC stale-write SERIALIZATION guard, which is a separate, tx-ending
+# error). Point the badge at the new parent, then the same commit gate passes.
+DO c c-restore-parent OK INSERT INTO branch (id, code) VALUES (9, 'new-parent')
+DO c c-repoint-child OK UPDATE badge SET branch_id=9 WHERE id='arrived'
+DO c c-commit-ok OK COMMIT
+ASSERT_SEQUENCE 3
+
+DO o history-end OK SHOW HISTORY
+DO o events OK SHOW EVENTS

@@ -1,0 +1,41 @@
+# Scenario D — control group proving the phase difference.
+# The SAME deferrable FK behaves two ways depending on its mode:
+#   IMMEDIATE -> missing parent is caught at the WRITE (statement) entry; the
+#                statement is rolled back and leaves NO pending intent.
+#   DEFERRED  -> the write is accepted (verdict "deferred", examined 0) and is
+#                only judged at the COMMIT entry.
+# Also shows the savepoint repair path used by the built-in demo.
+
+# Baseline parent.
+DO c base-begin OK BEGIN
+DO c base-branch OK INSERT INTO branch (id, code) VALUES (1, 'north')
+DO c base-commit OK COMMIT
+ASSERT_SEQUENCE 1
+
+# D1: switch the deferred FK to IMMEDIATE inside a transaction.
+DO c d1-begin OK BEGIN
+DO c d1-set-imm OK SET CONSTRAINTS badge_branch IMMEDIATE
+# WRITE ENTRY now performs a real check -> rejected immediately, not at commit.
+DO c d1-insert-fail CONSTRAINT_VIOLATION INSERT INTO badge (id, branch_id) VALUES ('nope', 55)
+# No intent was retained: the transaction still reports zero writes and stays open.
+DO c d1-show-tx OK SHOW TRANSACTION
+# A valid insert (existing parent 1) still succeeds in the same transaction.
+DO c d1-insert-ok OK INSERT INTO badge (id, branch_id) VALUES ('ok1', 1)
+DO c d1-commit OK COMMIT
+ASSERT_SEQUENCE 2
+
+# D2: savepoint repair of a deferred violation (rollback the offending write).
+DO c d2-begin OK BEGIN
+DO c d2-savepoint OK SAVEPOINT batch
+DO c d2-bad-child OK INSERT INTO badge (id, branch_id) VALUES ('stray', 88)
+# Forcing immediate mode surfaces the violation at a mode-change phase.
+DO c d2-set-imm-fail CONSTRAINT_VIOLATION SET CONSTRAINTS badge_branch IMMEDIATE
+# Roll back to the savepoint: the bad intent is discarded, modes restored.
+DO c d2-rollback-to OK ROLLBACK TO batch
+DO c d2-set-imm-now-ok OK SET CONSTRAINTS ALL IMMEDIATE
+DO c d2-good-child OK INSERT INTO badge (id, branch_id) VALUES ('good', 1)
+DO c d2-commit OK COMMIT
+ASSERT_SEQUENCE 3
+
+DO c history OK SHOW HISTORY
+DO c events OK SHOW EVENTS

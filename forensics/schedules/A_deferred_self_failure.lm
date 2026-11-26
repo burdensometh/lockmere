@@ -1,0 +1,30 @@
+# Scenario A — deferred check itself fails at COMMIT.
+# Child badge 'stray' references parent branch 7 that never existed anywhere.
+# At the write entry the FK is deferrable-deferred -> statement phase emits
+# Deferred (examined 0) and the INSERT is accepted. At the commit entry the
+# whole FK is re-evaluated -> MissingParent, commit refused, tx stays active.
+# The tx then repairs by inserting the missing parent and commits successfully.
+
+# Baseline: one valid parent branch (id 1) already committed.
+DO c base-begin OK BEGIN
+DO c base-branch OK INSERT INTO branch (id, code) VALUES (1, 'north')
+DO c base-commit OK COMMIT
+ASSERT_SEQUENCE 1
+
+# Failing transaction: child points at branch 7, which does not exist.
+DO c fk-begin OK BEGIN
+DO c fk-badge OK INSERT INTO badge (id, branch_id) VALUES ('stray', 7)
+DO c fk-commit-fail CONSTRAINT_VIOLATION COMMIT
+# Failed commit did not end the transaction and kept the pending write.
+DO c fk-show-tx OK SHOW TRANSACTION
+# The failed tx can still read its own pending (uncommitted) child row.
+DO c fk-read-child OK GET badge 'stray'
+# Repair inside the SAME transaction: add the previously missing parent.
+DO c fk-add-parent OK INSERT INTO branch (id, code) VALUES (7, 'repair')
+DO c fk-commit-ok OK COMMIT
+ASSERT_SEQUENCE 2
+
+# Durable history contains the repaired commit; there is no frame for the
+# rejected commit (its sequence was never assigned / appended).
+DO c history OK SHOW HISTORY
+DO c events OK SHOW EVENTS

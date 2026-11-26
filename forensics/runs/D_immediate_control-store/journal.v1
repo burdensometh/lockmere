@@ -1,0 +1,10 @@
+LOCKMERE	1
+STORE	c47d9c5730f5c1c57e28717a87e5ab0a
+T	badge	S	branch_id:I:R	note:S:O
+T	branch	I	code:S:R
+F	badge_branch	badge	branch_id	branch	id	DD
+U	branch_code	branch	code	I
+DATA
+C	1	1	63	626173652d636f6d6d6974	1	branch:I1:U,code=S6e6f727468	E1	#65:3ca18c4b
+C	2	2	63	64312d636f6d6d6974	1	badge:S6f6b31:U,branch_id=I1,note=N	E2	#68:c435d0ee
+C	3	3	63	64322d636f6d6d6974	1	badge:S676f6f64:U,branch_id=I1,note=N	E3	#70:a9adf3be

@@ -1,0 +1,25 @@
+# store: /workspace/02-lockmere-20/forensics/runs/C_rollback_and_reopen-store
+# schedule: /workspace/02-lockmere-20/forensics/schedules/C_rollback_and_reopen.lm
+created v1 database, sequence 0
+c {"request":"base-begin","status":"ok","result":{"transaction":1,"snapshot":0,"isolation":"serializable","writes":0,"savepoints":0,"reads":0,"waiting":null}}
+c {"request":"base-branch","status":"ok","result":{"kind":"changed","row":{"table":"branch","id":1}}}
+c {"request":"base-commit","status":"ok","result":{"kind":"committed","transaction":1,"sequence":1,"writes":1,"replayed":false}}
+assert sequence 1
+c {"request":"bad-begin","status":"ok","result":{"transaction":2,"snapshot":1,"isolation":"serializable","writes":0,"savepoints":0,"reads":0,"waiting":null}}
+c {"request":"bad-badge","status":"ok","result":{"kind":"changed","row":{"table":"badge","id":"ghost"}}}
+c {"request":"bad-commit","status":"error","error":{"code":"CONSTRAINT_VIOLATION","message":"badge_branch: badge[\"ghost\"] references missing value Integer(40)","retryable":false,"transaction_ended":false,"detail":{"constraint":"badge_branch","detail":"badge[\"ghost\"] references missing value Integer(40)"}}}
+c {"request":"bad-show-tx","status":"ok","result":{"transaction":2,"snapshot":1,"isolation":"serializable","writes":1,"savepoints":0,"reads":0,"waiting":null}}
+c {"request":"bad-self-read","status":"ok","result":{"kind":"row","row":{"row":{"table":"badge","id":"ghost"},"values":{"branch_id":40,"note":null}}}}
+c {"request":"history-while-open","status":"ok","result":{"commits":[{"sequence":1,"transaction":1,"receipt":{"client":"c","request":"base-commit"},"writes":[{"row":{"table":"branch","id":1},"values":{"code":"north"}}]}]}}
+c {"request":"bad-rollback","status":"ok","result":{"kind":"rolled_back","transaction":2}}
+v {"request":"v-begin","status":"ok","result":{"transaction":3,"snapshot":1,"isolation":"serializable","writes":0,"savepoints":0,"reads":0,"waiting":null}}
+v {"request":"v-ghost-gone","status":"ok","result":{"kind":"row","row":null}}
+v {"request":"v-history","status":"ok","result":{"commits":[{"sequence":1,"transaction":1,"receipt":{"client":"c","request":"base-commit"},"writes":[{"row":{"table":"branch","id":1},"values":{"code":"north"}}]}]}}
+v {"request":"v-end","status":"ok","result":{"kind":"rolled_back","transaction":3}}
+reopen sequence 1
+r {"request":"r-begin","status":"ok","result":{"transaction":2,"snapshot":1,"isolation":"serializable","writes":0,"savepoints":0,"reads":0,"waiting":null}}
+r {"request":"r-history","status":"ok","result":{"commits":[{"sequence":1,"transaction":1,"receipt":{"client":"c","request":"base-commit"},"writes":[{"row":{"table":"branch","id":1},"values":{"code":"north"}}]}]}}
+r {"request":"r-branch","status":"ok","result":{"kind":"row","row":{"row":{"table":"branch","id":1},"values":{"code":"north"}}}}
+r {"request":"r-no-ghost","status":"ok","result":{"kind":"row","row":null}}
+r {"request":"r-end","status":"ok","result":{"kind":"rolled_back","transaction":2}}
+assert sequence 1

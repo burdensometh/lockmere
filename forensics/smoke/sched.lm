@@ -1,0 +1,9 @@
+DO c seed-begin OK BEGIN
+DO c seed-branch OK INSERT INTO branch (id, code) VALUES (1, 'north')
+DO c seed-commit OK COMMIT
+ASSERT_SEQUENCE 1
+DO c bad-begin OK BEGIN
+DO c bad-badge OK INSERT INTO badge (id, branch_id) VALUES ('x', 99)
+DO c bad-commit CONSTRAINT_VIOLATION COMMIT
+DO c show-tx OK SHOW TRANSACTION
+DO c rb OK ROLLBACK
