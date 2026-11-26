@@ -5,12 +5,33 @@ use std::{
     path::Path,
 };
 
-use super::{codec, record, CommitLog, CommitResult, DurableState, CHECKPOINT_FILE};
+use super::{
+    codec,
+    receipts::ReceiptBinding,
+    record, CommitLog, CommitResult, DurableState, CHECKPOINT_FILE,
+};
 use crate::{
     constraints::{Evaluator, Schema},
     error::{Error, Result},
     rows::{PendingRows, RowId, RowVersion, Sequence, TxId},
 };
+
+/// How a checkpoint generation supplies its durable request receipts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReceiptSource {
+    /// Legacy v1 checkpoint: `R` lines are embedded in the checkpoint file and
+    /// were decoded directly into [`DurableState::receipts`].
+    Embedded,
+    /// Current checkpoint: receipts live in the independent index bound by the
+    /// enclosed fingerprint.
+    Index(ReceiptBinding),
+}
+
+pub(crate) struct OpenedCheckpoint {
+    pub anchor: Anchor,
+    pub state: DurableState,
+    pub receipts: ReceiptSource,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Anchor {
@@ -47,11 +68,20 @@ pub(crate) fn write(
     fingerprint: u64,
     anchor: Anchor,
     state: &DurableState,
+    receipt_index: ReceiptBinding,
 ) -> Result<()> {
     let mut out = BufferedCheckpoint::new(file);
+    // Version 2 keeps row heads and commit identities here, but commit
+    // receipts live in the independent `receipts.v1` index bound by size/hash.
     out.line(&format!(
-        "LOCKMERE-SNAPSHOT\t1\t{fingerprint}\t{}\t{}\t{}\t{}\t{}",
-        state.sequence, state.highest_tx, anchor.start, anchor.end, anchor.hash
+        "LOCKMERE-SNAPSHOT\t2\t{fingerprint}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        state.sequence,
+        state.highest_tx,
+        anchor.start,
+        anchor.end,
+        anchor.hash,
+        receipt_index.size,
+        receipt_index.hash
     ))?;
     for (id, version) in state.index.heads() {
         let values = codec::row(version.values.as_ref());
@@ -66,16 +96,6 @@ pub(crate) fn write(
     for (transaction, sequence) in &state.committed {
         out.line(&format!("X\t{transaction}\t{sequence}"))?;
     }
-    for (id, result) in &state.receipts {
-        out.line(&format!(
-            "R\t{}\t{}\t{}\t{}\t{}",
-            codec::hex_encode(&id.client),
-            codec::hex_encode(&id.request),
-            result.transaction,
-            result.sequence,
-            result.writes
-        ))?;
-    }
     out.finish()
 }
 
@@ -83,7 +103,7 @@ pub(crate) fn read(
     path: &Path,
     schema: &Schema,
     fingerprint: u64,
-) -> Result<Option<(Anchor, DurableState)>> {
+) -> Result<Option<OpenedCheckpoint>> {
     let file = match File::open(path.join(CHECKPOINT_FILE)) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -100,14 +120,24 @@ pub(crate) fn read(
         return Err(bad(0, "missing checkpoint header"));
     }
     let content = decode(&line, offset)?;
-    let (anchor, mut state) =
-        header(content, fingerprint).map_err(|message| bad(offset, message))?;
+    let ParsedHeader {
+        anchor,
+        sequence,
+        highest_tx,
+        receipts,
+        version,
+    } = header(content, fingerprint).map_err(|message| bad(offset, message))?;
+    let mut state = DurableState {
+        sequence,
+        highest_tx,
+        ..DurableState::default()
+    };
     rolling.update(&line);
     offset += line.len() as u64;
     let mut last_head = None;
     let mut last_tx = 0;
     let mut sequences = BTreeSet::new();
-    let mut receipts = BTreeSet::new();
+    let mut receipts_seen = BTreeSet::new();
     let mut last_request = None;
     let mut step = 0;
 
@@ -138,7 +168,9 @@ pub(crate) fn read(
                 last_tx = transaction;
                 state.committed.insert(transaction, sequence);
             }
-            ["R", client, request, tx, seq, writes] if step <= 2 => {
+            // Legacy v1 checkpoints embed the receipts as ordered R records.
+            // They remain readable in their original format.
+            ["R", client, request, tx, seq, writes] if version == 1 && step <= 2 => {
                 step = 2;
                 let id = record::decode_request(client, request)
                     .map_err(|message| bad(offset, message))?
@@ -151,7 +183,7 @@ pub(crate) fn read(
                     .is_some_and(|previous| previous >= &id)
                     || state.committed.get(&transaction) != Some(&sequence)
                     || writes > record::MAX_CHANGES
-                    || !receipts.insert(transaction)
+                    || !receipts_seen.insert(transaction)
                 {
                     return Err(bad(offset, "invalid checkpoint receipt"));
                 }
@@ -176,7 +208,11 @@ pub(crate) fn read(
                     return Err(bad(offset, "unexpected data after checkpoint footer"));
                 }
                 validate_state(schema, &state, last_tx, sequences.len(), offset)?;
-                return Ok(Some((anchor, state)));
+                return Ok(Some(OpenedCheckpoint {
+                    anchor,
+                    state,
+                    receipts,
+                }));
             }
             _ => return Err(bad(offset, "unknown or out-of-order checkpoint record")),
         }
@@ -210,25 +246,71 @@ pub(crate) fn anchor_matches_commit(state: &DurableState, commit: &CommitLog) ->
         })
 }
 
-fn header(content: &str, fingerprint: u64) -> std::result::Result<(Anchor, DurableState), String> {
+struct ParsedHeader {
+    anchor: Anchor,
+    sequence: Sequence,
+    highest_tx: TxId,
+    receipts: ReceiptSource,
+    version: u32,
+}
+
+fn header(content: &str, fingerprint: u64) -> std::result::Result<ParsedHeader, String> {
     let fields: Vec<_> = content.split('\t').collect();
-    let ["LOCKMERE-SNAPSHOT", "1", digest, seq, tx, start, end, hash] = fields.as_slice() else {
-        return Err("invalid checkpoint header".to_owned());
-    };
-    if codec::num::<u64>(digest)? != fingerprint {
-        return Err("checkpoint is bound to a different schema".to_owned());
+    match fields.as_slice() {
+        // Original v1 header; receipts are embedded as R records.
+        ["LOCKMERE-SNAPSHOT", "1", digest, seq, tx, start, end, hash] => {
+            if codec::num::<u64>(digest)? != fingerprint {
+                return Err("checkpoint is bound to a different schema".to_owned());
+            }
+            let anchor = Anchor {
+                start: codec::num(start)?,
+                end: codec::num(end)?,
+                hash: codec::num(hash)?,
+            };
+            Ok(ParsedHeader {
+                anchor,
+                sequence: codec::num(seq)?,
+                highest_tx: codec::num(tx)?,
+                receipts: ReceiptSource::Embedded,
+                version: 1,
+            })
+        }
+        // v2 header binds the checkpoint generation to an independent receipt
+        // index through its byte length and rolling hash.
+        [
+            "LOCKMERE-SNAPSHOT",
+            "2",
+            digest,
+            seq,
+            tx,
+            start,
+            end,
+            hash,
+            receipts_size,
+            receipts_hash,
+        ] => {
+            if codec::num::<u64>(digest)? != fingerprint {
+                return Err("checkpoint is bound to a different schema".to_owned());
+            }
+            let anchor = Anchor {
+                start: codec::num(start)?,
+                end: codec::num(end)?,
+                hash: codec::num(hash)?,
+            };
+            let binding = ReceiptBinding {
+                size: codec::num(receipts_size)?,
+                hash: codec::num(receipts_hash)?,
+            };
+            Ok(ParsedHeader {
+                anchor,
+                sequence: codec::num(seq)?,
+                highest_tx: codec::num(tx)?,
+                receipts: ReceiptSource::Index(binding),
+                version: 2,
+            })
+        }
+        _ => Err("invalid checkpoint header".to_owned()),
     }
-    let anchor = Anchor {
-        start: codec::num(start)?,
-        end: codec::num(end)?,
-        hash: codec::num(hash)?,
-    };
-    let state = DurableState {
-        sequence: codec::num(seq)?,
-        highest_tx: codec::num(tx)?,
-        ..DurableState::default()
-    };
-    Ok((anchor, state))
 }
 
 fn decode_head(

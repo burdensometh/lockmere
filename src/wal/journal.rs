@@ -1,12 +1,14 @@
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions, TryLockError},
     io::{BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
 use super::{
-    checkpoint::{self, Anchor},
-    codec, schema, CommitLog, DurableState, JOURNAL_FILE,
+    checkpoint::{self, Anchor, ReceiptSource},
+    codec, receipts, schema, CommitLog, CommitResult, DurableState, RequestId, CHECKPOINT_FILE,
+    JOURNAL_FILE,
 };
 use crate::{
     constraints::Schema,
@@ -23,6 +25,22 @@ pub enum FaultPoint {
     BeforeAppend,
     AfterSyncBeforePublish,
     BeforeCheckpointPublish,
+    // Receipt-index migration boundaries. The canonical interruption point for
+    // a whole checkpoint remains `BeforeCheckpointPublish`; these finer points
+    // describe the independent index publication and are exercised by the same
+    // recovery guarantees.
+    BeforeReceiptMigration,
+    BeforeReceiptIndexWrite,
+    BeforeReceiptsWrite,
+    AfterReceiptIndexSyncBeforePublish,
+    AfterReceiptsSyncBeforePublish,
+    BeforeReceiptIndexPublish,
+    BeforeReceiptsPublish,
+    BeforeIndexPublish,
+    BeforeReceiptIndexRename,
+    BeforeReceiptsRename,
+    AfterReceiptIndexPublish,
+    BetweenReceiptIndexAndCheckpointPublish,
 }
 
 impl FaultPoint {
@@ -31,6 +49,22 @@ impl FaultPoint {
             Self::BeforeAppend => "before_append",
             Self::AfterSyncBeforePublish => "after_sync_before_publish",
             Self::BeforeCheckpointPublish => "before_checkpoint_publish",
+            Self::BeforeReceiptMigration => "before_receipt_migration",
+            Self::BeforeReceiptIndexWrite => "before_receipt_index_write",
+            Self::BeforeReceiptsWrite => "before_receipts_write",
+            Self::AfterReceiptIndexSyncBeforePublish => {
+                "after_receipt_index_sync_before_publish"
+            }
+            Self::AfterReceiptsSyncBeforePublish => "after_receipts_sync_before_publish",
+            Self::BeforeReceiptIndexPublish => "before_receipt_index_publish",
+            Self::BeforeReceiptsPublish => "before_receipts_publish",
+            Self::BeforeIndexPublish => "before_index_publish",
+            Self::BeforeReceiptIndexRename => "before_receipt_index_rename",
+            Self::BeforeReceiptsRename => "before_receipts_rename",
+            Self::AfterReceiptIndexPublish => "after_receipt_index_publish",
+            Self::BetweenReceiptIndexAndCheckpointPublish => {
+                "between_receipt_index_and_checkpoint_publish"
+            }
         }
     }
 }
@@ -100,12 +134,46 @@ impl Journal {
     }
 
     pub fn checkpoint(&mut self, state: &DurableState, faults: &dyn FaultInjector) -> Result<u64> {
+        // Stage 1: independent receipt index. It is written and synced first
+        // under its own temporary name; the canonical index is only replaced by
+        // an atomic rename during publication.
+        let receipts_temporary = receipts::temporary_path(&self.root);
+        let mut receipts_file = open_temporary(&receipts_temporary)?;
+        faults.hit(FaultPoint::BeforeReceiptMigration)?;
+        faults.hit(FaultPoint::BeforeReceiptIndexWrite)?;
+        faults.hit(FaultPoint::BeforeReceiptsWrite)?;
+        let receipt_binding = receipts::write(&mut receipts_file, &state.receipts)?;
+        codec::io_result("sync receipt index", receipts_file.sync_all())?;
+        faults.hit(FaultPoint::AfterReceiptIndexSyncBeforePublish)?;
+        faults.hit(FaultPoint::AfterReceiptsSyncBeforePublish)?;
+        drop(receipts_file);
+
+        // Stage 2: checkpoint bound to that exact index generation.
         let temporary = self.root.join(TEMPORARY_CHECKPOINT);
         let mut file = open_temporary(&temporary)?;
-        checkpoint::write(&mut file, self.fingerprint, self.anchor, state)?;
+        checkpoint::write(
+            &mut file,
+            self.fingerprint,
+            self.anchor,
+            state,
+            receipt_binding,
+        )?;
         codec::io_result("sync checkpoint", file.sync_all())?;
+        // The legacy interruption boundary: before either canonical file is
+        // replaced. Both previous generations remain complete on disk.
         faults.hit(FaultPoint::BeforeCheckpointPublish)?;
         drop(file);
+
+        // Publication: index first, checkpoint last. Once the checkpoint rename
+        // lands, observers can only find it bound to an already-durable index.
+        faults.hit(FaultPoint::BeforeReceiptIndexPublish)?;
+        faults.hit(FaultPoint::BeforeReceiptsPublish)?;
+        faults.hit(FaultPoint::BeforeIndexPublish)?;
+        faults.hit(FaultPoint::BeforeReceiptIndexRename)?;
+        faults.hit(FaultPoint::BeforeReceiptsRename)?;
+        receipts::publish(&self.root, &receipts_temporary)?;
+        faults.hit(FaultPoint::AfterReceiptIndexPublish)?;
+        faults.hit(FaultPoint::BetweenReceiptIndexAndCheckpointPublish)?;
         checkpoint::publish(&self.root, &temporary)?;
         Ok(self.anchor.end)
     }
@@ -164,10 +232,33 @@ impl Journal {
         let mut anchor = Anchor::empty(data_start);
         let mut state = DurableState::default();
         if recover {
-            if let Some((saved_anchor, saved_state)) = checkpoint::read(root, &schema, fingerprint)?
-            {
-                verify_anchor(&mut reader, saved_anchor, &saved_state, data_start)?;
-                anchor = saved_anchor;
+            if let Some(opened) = checkpoint::read(root, &schema, fingerprint)? {
+                let mut saved_state = opened.state;
+                match opened.receipts {
+                    // Legacy v1 checkpoint already carries its complete receipts.
+                    ReceiptSource::Embedded => {}
+                    ReceiptSource::Index(binding) => {
+                        match receipts::read(root, binding, &saved_state.committed)? {
+                            receipts::LoadedIndex::Match(indexed) => {
+                                saved_state.receipts = indexed;
+                            }
+                            // The index is absent (subset copy) or belongs to a
+                            // generation whose checkpoint did not become
+                            // effective (interrupted publication). The complete
+                            // append-only journal reconstructs the prefix.
+                            receipts::LoadedIndex::Missing
+                            | receipts::LoadedIndex::Stale => {
+                                saved_state.receipts = rebuild_receipts(
+                                    &mut reader,
+                                    data_start,
+                                    saved_state.sequence,
+                                )?;
+                            }
+                        }
+                    }
+                }
+                verify_anchor(&mut reader, opened.anchor, &saved_state, data_start)?;
+                anchor = opened.anchor;
                 state = saved_state;
             }
         }
@@ -252,7 +343,7 @@ fn verify_anchor(
     state: &DurableState,
     data_start: u64,
 ) -> Result<()> {
-    let bad = |message| Error::corrupt(super::CHECKPOINT_FILE, 0, message);
+    let bad = |message| Error::corrupt(CHECKPOINT_FILE, 0, message);
     let available = codec::io_result("stat journal", reader.get_ref().metadata())?.len();
     if anchor.start < data_start || anchor.end < anchor.start || anchor.end > available {
         return Err(bad("checkpoint offsets fall outside the journal"));
@@ -294,12 +385,59 @@ fn verify_anchor(
     Ok(())
 }
 
+/// Reconstruct durable request receipts for every commit up to and including
+/// `through` directly from the append-only journal. This is the recovery path
+/// when an independent receipt index is missing or belongs to a generation
+/// that never became effective.
+fn rebuild_receipts(
+    reader: &mut BufReader<File>,
+    data_start: u64,
+    through: crate::rows::Sequence,
+) -> Result<BTreeMap<RequestId, CommitResult>> {
+    let mut receipts = BTreeMap::new();
+    if through == 0 {
+        return Ok(receipts);
+    }
+    codec::io_result(
+        "seek receipt rebuild",
+        reader.seek(SeekFrom::Start(data_start)),
+    )?;
+    let mut line = Vec::new();
+    let mut offset = data_start;
+    let mut expected = 1;
+    loop {
+        if !codec::next_line(reader, &mut line, JOURNAL_FILE, offset)? {
+            return Err(Error::corrupt(
+                JOURNAL_FILE,
+                offset,
+                "journal ends before checkpoint sequence while rebuilding receipts",
+            ));
+        }
+        let record = decode_at(&line, offset)?;
+        if record.sequence != expected {
+            return Err(Error::corrupt(
+                JOURNAL_FILE,
+                offset,
+                "nonconsecutive commit while rebuilding receipts",
+            ));
+        }
+        let result = record.result();
+        if let Some(request) = record.receipt {
+            receipts.insert(request, result);
+        }
+        offset += line.len() as u64;
+        if record.sequence == through {
+            return Ok(receipts);
+        }
+        expected += 1;
+    }
+}
+
 fn read_required(
     reader: &mut impl std::io::BufRead,
     line: &mut Vec<u8>,
     offset: u64,
-) -> Result<CommitLog> {
-    if !codec::next_line(reader, line, JOURNAL_FILE, offset)? {
+) -> Result<CommitLog> {    if !codec::next_line(reader, line, JOURNAL_FILE, offset)? {
         return Err(Error::corrupt(
             JOURNAL_FILE,
             offset,
